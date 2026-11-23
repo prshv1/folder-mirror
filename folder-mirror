@@ -1,0 +1,196 @@
+#!/usr/bin/env python3
+"""Two-way folder mirror for macOS."""
+
+from __future__ import annotations
+
+import datetime
+import fcntl
+import hashlib
+import json
+import os
+import shutil
+import sys
+from pathlib import Path
+
+DIR_A = Path(os.environ.get("MIRROR_DIR_A", str(Path.home() / "folder-a"))).expanduser()
+DIR_B = Path(os.environ.get("MIRROR_DIR_B", str(Path.home() / "folder-b"))).expanduser()
+STATE_DIR = Path(os.environ.get("FOLDER_MIRROR_STATE_DIR", str(Path.home() / ".local/state/folder-mirror"))).expanduser()
+STATE_FILE = STATE_DIR / "state.json"
+LOCK_FILE = STATE_DIR / "sync.lock"
+
+EXCLUDED_NAMES = {
+    ".git",
+    ".system",
+    ".obsidian",
+    ".DS_Store",
+}
+
+
+def is_excluded(rel_parts: tuple[str, ...]) -> bool:
+    for part in rel_parts:
+        if part in EXCLUDED_NAMES or part.startswith("._") or part.endswith(".obsidian"):
+            return True
+    return False
+
+
+def file_signature(path: Path) -> dict[str, object]:
+    st = path.lstat()
+    if path.is_symlink():
+        target = os.readlink(path)
+        digest = hashlib.sha256(f"symlink:{target}".encode("utf-8")).hexdigest()
+        return {"type": "symlink", "target": target, "hash": digest, "mtime": st.st_mtime}
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return {"type": "file", "hash": h.hexdigest(), "mtime": st.st_mtime}
+
+
+def scan_dir(root: Path) -> dict[str, dict[str, object]]:
+    entries: dict[str, dict[str, object]] = {}
+    if not root.exists():
+        return entries
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        rel_dir = Path(dirpath).relative_to(root)
+        # Prune excluded directories in-place
+        dirnames[:] = [
+            d for d in dirnames
+            if not is_excluded(rel_dir.parts + (d,))
+        ]
+        for name in filenames:
+            rel_path = rel_dir / name if str(rel_dir) != "." else Path(name)
+            if is_excluded(rel_path.parts):
+                continue
+            full_path = root / rel_path
+            try:
+                entries[rel_path.as_posix()] = file_signature(full_path)
+            except FileNotFoundError:
+                continue
+    return entries
+
+
+def copy_entry(src_root: Path, dst_root: Path, rel: str) -> None:
+    src = src_root / rel
+    dst = dst_root / rel
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if dst.exists() or dst.is_symlink():
+        if dst.is_dir() and not dst.is_symlink():
+            shutil.rmtree(dst)
+        else:
+            dst.unlink()
+    if src.is_symlink():
+        os.symlink(os.readlink(src), dst)
+    else:
+        shutil.copy2(src, dst)
+
+
+def remove_entry(root: Path, rel: str) -> None:
+    target = root / rel
+    if target.exists() or target.is_symlink():
+        if target.is_dir() and not target.is_symlink():
+            shutil.rmtree(target)
+        else:
+            target.unlink()
+    # Prune now-empty parent directories up to root
+    parent = target.parent
+    while parent != root and parent.exists():
+        try:
+            parent.rmdir()
+        except OSError:
+            break
+        parent = parent.parent
+
+
+def load_state() -> dict[str, dict[str, object]]:
+    if not STATE_FILE.exists():
+        return {}
+    try:
+        data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        return data.get("files", {}) if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_state(files: dict[str, dict[str, object]]) -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = STATE_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps({"files": files}, indent=2, sort_keys=True), encoding="utf-8")
+    tmp.replace(STATE_FILE)
+
+
+def log(msg: str) -> None:
+    ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{ts}] {msg}", flush=True)
+
+
+def sync() -> int:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    with LOCK_FILE.open("w") as lock_fh:
+        try:
+            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return 0
+
+        if not DIR_A.exists() or not DIR_B.exists():
+            log(f"Skipping sync: missing directory ({DIR_A.exists()=}, {DIR_B.exists()=})")
+            return 1
+
+        prev = load_state()
+        snap_a = scan_dir(DIR_A)
+        snap_b = scan_dir(DIR_B)
+
+        all_paths = sorted(set(snap_a) | set(snap_b) | set(prev))
+        actions: list[str] = []
+
+        for rel in all_paths:
+            in_a = snap_a.get(rel)
+            in_b = snap_b.get(rel)
+            in_p = prev.get(rel)
+
+            if in_a and in_b:
+                if in_a["hash"] == in_b["hash"]:
+                    continue
+                a_changed = (in_p is None) or (in_a["hash"] != in_p.get("hash"))
+                b_changed = (in_p is None) or (in_b["hash"] != in_p.get("hash"))
+                if a_changed and not b_changed:
+                    copy_entry(DIR_A, DIR_B, rel)
+                    actions.append(f"A->B {rel}")
+                elif b_changed and not a_changed:
+                    copy_entry(DIR_B, DIR_A, rel)
+                    actions.append(f"B->A {rel}")
+                else:
+                    # Both changed: newer mtime wins
+                    if float(in_a["mtime"]) >= float(in_b["mtime"]):
+                        copy_entry(DIR_A, DIR_B, rel)
+                        actions.append(f"A->B (conflict, newer) {rel}")
+                    else:
+                        copy_entry(DIR_B, DIR_A, rel)
+                        actions.append(f"B->A (conflict, newer) {rel}")
+            elif in_a and not in_b:
+                if in_p is not None and in_a["hash"] == in_p.get("hash"):
+                    remove_entry(DIR_A, rel)
+                    actions.append(f"DEL A {rel}")
+                else:
+                    copy_entry(DIR_A, DIR_B, rel)
+                    actions.append(f"A->B {rel}")
+            elif in_b and not in_a:
+                if in_p is not None and in_b["hash"] == in_p.get("hash"):
+                    remove_entry(DIR_B, rel)
+                    actions.append(f"DEL B {rel}")
+                else:
+                    copy_entry(DIR_B, DIR_A, rel)
+                    actions.append(f"B->A {rel}")
+
+        # Re-scan after sync to record exact post-sync state
+        final_state = scan_dir(DIR_A)
+        save_state(final_state)
+
+        if actions:
+            for act in actions:
+                log(act)
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(sync())
