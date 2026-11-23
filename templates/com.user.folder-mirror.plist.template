@@ -8,6 +8,7 @@
     <array>
         <string>{{PYTHON3}}</string>
         <string>{{HOME}}/.local/bin/folder-mirror</string>
+        <string>--watch</string>
     </array>
     <key>EnvironmentVariables</key>
     <dict>
@@ -18,15 +19,12 @@
         <key>MIRROR_DIR_B</key>
         <string>{{DIR_B}}</string>
     </dict>
-    <key>WatchPaths</key>
-    <array>
-        <string>{{DIR_A}}</string>
-        <string>{{DIR_B}}</string>
-    </array>
-    <key>StartInterval</key>
-    <integer>30</integer>
     <key>RunAtLoad</key>
     <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
     <key>ProcessType</key>
     <string>Background</string>
     <key>LowPriorityIO</key>

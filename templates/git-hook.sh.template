@@ -3,4 +3,6 @@ export MIRROR_DIR_A="{{DIR_A}}"
 export MIRROR_DIR_B="{{DIR_B}}"
 [ "${FOLDER_MIRROR_GIT_SYNC:-0}" = "1" ] && exit 0
 unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_QUARANTINE_PATH GIT_PREFIX GIT_SUPER_PREFIX
-/opt/homebrew/bin/python3 $HOME/.local/bin/folder-mirror --wait 10 --source {{SIDE}} >/dev/null 2>>$HOME/.local/state/folder-mirror/launchd.err.log || true
+PYTHON="/opt/homebrew/bin/python3"
+[ -x "$PYTHON" ] || PYTHON="/usr/bin/python3"
+"$PYTHON" $HOME/.local/bin/folder-mirror --wait 10 --source {{SIDE}} >/dev/null 2>>$HOME/.local/state/folder-mirror/launchd.err.log || true

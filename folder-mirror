@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 import datetime
 import fcntl
 import hashlib
@@ -11,6 +12,7 @@ import json
 import os
 import secrets
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -24,6 +26,9 @@ DIR_B = Path(os.environ.get("MIRROR_DIR_B", str(Path.home() / "folder-b"))).expa
 STATE_DIR = Path(os.environ.get("FOLDER_MIRROR_STATE_DIR", str(Path.home() / ".local/state/folder-mirror"))).expanduser()
 STATE_FILE = STATE_DIR / "state.json"
 LOCK_FILE = STATE_DIR / "sync.lock"
+WATCH_LOCK_FILE = STATE_DIR / "watch.lock"
+ALERT_FILE = STATE_DIR / "last_alert.json"
+GIT_HEAD_RECOVERY_FILE = STATE_DIR / "git_head_sync.json"
 LOG_FILE = STATE_DIR / "sync.log"
 ERR_LOG_FILE = STATE_DIR / "sync.err.log"
 LAUNCHD_LOG_FILE = STATE_DIR / "launchd.log"
@@ -34,6 +39,11 @@ MAX_LOG_BYTES = 256 * 1024
 STALE_TMP_AGE_SECONDS = 300.0
 MAX_CONFLICT_BACKUPS = 50
 GIT_TIMEOUT_SECONDS = 30
+NOTIFY_TIMEOUT_SECONDS = 3
+WATCH_LATENCY_SECONDS = 0.35
+WATCH_BUSY_RETRY_SECONDS = 0.5
+WATCH_RECONCILE_SECONDS = 300.0
+WATCH_RUNLOOP_SLICE_SECONDS = 2.0
 
 # Only exclude .git internals from raw file copying; git refs are synced safely via git commands.
 EXCLUDED_NAMES = {".git"}
@@ -92,13 +102,102 @@ def log(msg: str, *, err: bool = False) -> None:
 
 
 def rotate_log_file(path: Path) -> None:
-    """Atomically rotate log file to <name>.1 when over MAX_LOG_BYTES (no in-place truncation)."""
+    """Atomically rotate append-per-write log files to <name>.1 when over MAX_LOG_BYTES."""
     try:
         if path.exists() and path.stat().st_size > MAX_LOG_BYTES:
             rotated = path.with_name(path.name + ".1")
             path.replace(rotated)
     except OSError:
         pass
+
+
+def rotate_copytruncate_log_file(path: Path) -> None:
+    """Copy-and-truncate logs held open by launchd so FDs keep writing to the active path."""
+    try:
+        if not path.exists() or path.stat().st_size <= MAX_LOG_BYTES:
+            return
+        rotated = path.with_name(path.name + ".1")
+        tmp = path.with_name(path.name + ".1.tmp")
+        shutil.copy2(path, tmp)
+        tmp.replace(rotated)
+        os.truncate(path, 0)
+    except OSError:
+        pass
+
+
+def write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    raw = json.dumps(payload, indent=2, sort_keys=True)
+    with tmp.open("w", encoding="utf-8") as fh:
+        fh.write(raw)
+        fh.flush()
+        os.fsync(fh.fileno())
+    tmp.replace(path)
+
+
+def notify_once(channel: str, alert_key: str, title: str, message: str) -> None:
+    """Send a deduplicated macOS notification once per unique alert key per channel."""
+    if os.environ.get("FOLDER_MIRROR_NO_NOTIFY") == "1" or sys.platform != "darwin":
+        return
+    alerts: dict[str, Any] = {}
+    try:
+        if ALERT_FILE.exists():
+            prev = json.loads(ALERT_FILE.read_text(encoding="utf-8"))
+            if isinstance(prev, dict):
+                alerts = prev
+                if alerts.get(channel) == alert_key:
+                    return
+    except (OSError, ValueError):
+        pass
+
+    alerts[channel] = alert_key
+    alerts["ts"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    try:
+        write_json_atomic(ALERT_FILE, alerts)
+    except OSError:
+        pass
+
+    try:
+        subprocess.run(
+            [
+                "/usr/bin/osascript",
+                "-e",
+                "on run argv",
+                "-e",
+                "display notification (item 1 of argv) with title (item 2 of argv)",
+                "-e",
+                "end run",
+                "--",
+                message,
+                title,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=NOTIFY_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
+def clear_alert(channel: str) -> None:
+    try:
+        if not ALERT_FILE.exists():
+            return
+        prev = json.loads(ALERT_FILE.read_text(encoding="utf-8"))
+        if not isinstance(prev, dict) or channel not in prev:
+            return
+        prev.pop(channel, None)
+        remaining = {k: v for k, v in prev.items() if k != "ts"}
+        if not remaining:
+            ALERT_FILE.unlink(missing_ok=True)
+        else:
+            write_json_atomic(ALERT_FILE, prev)
+    except (OSError, ValueError):
+        try:
+            ALERT_FILE.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def stat_meta(st: os.stat_result, entry_type: str) -> dict[str, int]:
@@ -182,8 +281,12 @@ def cleanup_stale_temp(path: Path) -> None:
     try:
         st = path.lstat()
         if time.time() - st.st_mtime > STALE_TMP_AGE_SECONDS:
-            path.unlink(missing_ok=True)
-            log(f"Cleaned stale temp file: {path}")
+            if stat.S_ISDIR(st.st_mode) and not stat.S_ISLNK(st.st_mode):
+                shutil.rmtree(path, ignore_errors=True)
+                log(f"Cleaned stale temp directory: {path}")
+            else:
+                path.unlink(missing_ok=True)
+                log(f"Cleaned stale temp file: {path}")
     except OSError:
         pass
 
@@ -267,6 +370,12 @@ def backup_conflict(dst_root: Path, rel: str, losing_side: str) -> None:
             backup_path.parent.mkdir(parents=True, exist_ok=True)
             backup_path.write_text(f"{target}\n", encoding="utf-8")
             log(f"CONFLICT symlink backup saved ({rel} -> {target}): {backup_path}")
+            notify_once(
+                "conflict",
+                f"symlink:{rel}:{ts}",
+                "Folder Mirror Conflict Backup",
+                f"Backed up losing symlink {rel} ({losing_side}) to conflicts/",
+            )
             prune_conflict_backups()
             return
         if not dst.is_file():
@@ -275,6 +384,12 @@ def backup_conflict(dst_root: Path, rel: str, losing_side: str) -> None:
         backup_path.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(dst, backup_path)
         log(f"CONFLICT backup saved: {backup_path}")
+        notify_once(
+            "conflict",
+            f"file:{rel}:{ts}",
+            "Folder Mirror Conflict Backup",
+            f"Backed up losing version of {rel} ({losing_side}) to conflicts/",
+        )
         prune_conflict_backups()
     except OSError as exc:
         log(f"Warning: failed to back up conflict for {rel}: {exc}", err=True)
@@ -366,14 +481,7 @@ def load_state() -> dict[str, Any]:
 
 
 def save_state(state: dict[str, Any]) -> None:
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    tmp = STATE_FILE.with_suffix(".tmp")
-    payload = json.dumps(state, indent=2, sort_keys=True)
-    with tmp.open("w", encoding="utf-8") as fh:
-        fh.write(payload)
-        fh.flush()
-        os.fsync(fh.fileno())
-    tmp.replace(STATE_FILE)
+    write_json_atomic(STATE_FILE, state)
 
 
 def is_git_busy(repo: Path) -> bool:
@@ -427,10 +535,16 @@ def git_meta_fingerprint(repo: Path) -> str | None:
     return hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()
 
 
-def sanitized_git_env(*, set_sync_guard: bool = False) -> dict[str, str]:
+def sanitized_git_env(
+    *,
+    set_sync_guard: bool = False,
+    extra_env: dict[str, str] | None = None,
+) -> dict[str, str]:
     env = {k: v for k, v in os.environ.items() if k not in GIT_ENV_STRIP}
     if set_sync_guard:
         env["FOLDER_MIRROR_GIT_SYNC"] = "1"
+    if extra_env:
+        env.update(extra_env)
     return env
 
 
@@ -438,13 +552,14 @@ def git_run(
     repo: Path,
     *args: str,
     sync_guard: bool = False,
+    extra_env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     try:
         return subprocess.run(
             ["git", "-C", str(repo), *args],
             capture_output=True,
             text=True,
-            env=sanitized_git_env(set_sync_guard=sync_guard),
+            env=sanitized_git_env(set_sync_guard=sync_guard, extra_env=extra_env),
             timeout=GIT_TIMEOUT_SECONDS,
         )
     except subprocess.TimeoutExpired:
@@ -465,6 +580,53 @@ def git_out(repo: Path, *args: str) -> str | None:
 def git_has_staged_changes(repo: Path) -> bool:
     res = git_run(repo, "diff", "--cached", "--quiet")
     return res.returncode != 0
+
+
+def git_is_ancestor_cross_repo(
+    repo: Path,
+    other_repo: Path,
+    ancestor: str,
+    descendant: str,
+) -> bool:
+    """Strictly read-only ancestry check across both local object stores without touching FETCH_HEAD."""
+    alt_objects = str(other_repo / ".git" / "objects")
+    res = git_run(
+        repo,
+        "merge-base",
+        "--is-ancestor",
+        ancestor,
+        descendant,
+        extra_env={"GIT_ALTERNATE_OBJECT_DIRECTORIES": alt_objects},
+    )
+    return res.returncode == 0
+
+
+def recover_interrupted_git_head() -> None:
+    """Finish index alignment if a previous run was killed mid-apply_git_head."""
+    if not GIT_HEAD_RECOVERY_FILE.exists():
+        return
+    try:
+        data = json.loads(GIT_HEAD_RECOVERY_FILE.read_text(encoding="utf-8"))
+        dst_str = data.get("dst")
+        target_branch = data.get("target_branch")
+        target_head = data.get("target_head")
+        if isinstance(dst_str, str) and isinstance(target_branch, str) and isinstance(target_head, str):
+            dst = Path(dst_str).resolve()
+            if dst in (DIR_A.resolve(), DIR_B.resolve()) and (dst / ".git").is_dir():
+                cur_branch, cur_head = git_head_info(dst)
+                if cur_branch == target_branch and cur_head == target_head:
+                    res = git_run(dst, "reset", "--quiet", "--mixed", "HEAD", sync_guard=True)
+                    if res.returncode == 0:
+                        log(f"GIT recovery completed index reset in {dst} ({target_branch}@{target_head[:7]})")
+                    else:
+                        log(f"GIT recovery reset failed in {dst}: {res.stderr.strip()}", err=True)
+                        return
+    except Exception as exc:
+        log(f"Warning: failed to process git_head_sync recovery marker: {exc}", err=True)
+    try:
+        GIT_HEAD_RECOVERY_FILE.unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 def git_all_refs(repo: Path) -> tuple[dict[str, str], dict[str, str], dict[str, str]]:
@@ -522,18 +684,19 @@ def git_all_branch_tracking(repo: Path) -> dict[str, dict[str, str]]:
     }
 
 
-def set_branch_tracking(repo: Path, branch: str, tracking: dict[str, str] | None) -> bool:
+def set_branch_tracking(repo: Path, branch: str, tracking: dict[str, str] | None) -> tuple[bool, str]:
     if tracking is None:
-        git_run(repo, "config", "--unset", f"branch.{branch}.remote", sync_guard=True)
-        git_run(repo, "config", "--unset", f"branch.{branch}.merge", sync_guard=True)
-        return True
+        r1 = git_run(repo, "config", "--unset", f"branch.{branch}.remote", sync_guard=True)
+        r2 = git_run(repo, "config", "--unset", f"branch.{branch}.merge", sync_guard=True)
+        # git config --unset returns 5 when key does not exist; treat 0 or 5 as success.
+        ok = r1.returncode in (0, 5) and r2.returncode in (0, 5)
+        err = "; ".join(s for s in (r1.stderr.strip(), r2.stderr.strip()) if s)
+        return ok, err
     r1 = git_run(repo, "config", f"branch.{branch}.remote", tracking["remote"], sync_guard=True)
     r2 = git_run(repo, "config", f"branch.{branch}.merge", tracking["merge"], sync_guard=True)
-    return r1.returncode == 0 and r2.returncode == 0
-
-
-def git_is_ancestor(repo: Path, ancestor: str, descendant: str) -> bool:
-    return git_run(repo, "merge-base", "--is-ancestor", ancestor, descendant).returncode == 0
+    ok = r1.returncode == 0 and r2.returncode == 0
+    err = "; ".join(s for s in (r1.stderr.strip(), r2.stderr.strip()) if s)
+    return ok, err
 
 
 def git_head_info(repo: Path) -> tuple[str | None, str | None]:
@@ -545,16 +708,22 @@ def git_head_info(repo: Path) -> tuple[str | None, str | None]:
 def decide_git_head_direction(
     prev_git: dict[str, Any],
     source: str | None,
-) -> tuple[str | None, str | None, str | None, str | None, str | None]:
+) -> tuple[str, str | None, str | None, str | None, str | None]:
     """Return (direction, branch_a, head_a, branch_b, head_b).
 
-    direction is "A->B", "B->A", "EQUAL", "CONFLICT", or None (detached/missing).
+    direction is "A->B", "B->A", "EQUAL", "DETACHED_EQUAL", "DETACHED_MISMATCH",
+    "CONFLICT", or "UNBORN". Strictly read-only (never mutates FETCH_HEAD or objects).
     """
     branch_a, head_a = git_head_info(DIR_A)
     branch_b, head_b = git_head_info(DIR_B)
 
-    if not (branch_a and branch_b and head_a and head_b):
-        return None, branch_a, head_a, branch_b, head_b
+    if not head_a or not head_b:
+        return "UNBORN", branch_a, head_a, branch_b, head_b
+
+    if branch_a is None or branch_b is None:
+        if branch_a is None and branch_b is None and head_a == head_b:
+            return "DETACHED_EQUAL", None, head_a, None, head_b
+        return "DETACHED_MISMATCH", branch_a, head_a, branch_b, head_b
 
     a_state = (branch_a, head_a)
     b_state = (branch_b, head_b)
@@ -567,10 +736,9 @@ def decide_git_head_direction(
     if b_state != p_state and a_state == p_state:
         return "B->A", branch_a, head_a, branch_b, head_b
     if branch_a == branch_b:
-        git_run(DIR_A, "fetch", "--quiet", "--no-tags", str(DIR_B), "HEAD", sync_guard=True)
-        if git_is_ancestor(DIR_A, head_a, head_b):
+        if git_is_ancestor_cross_repo(DIR_A, DIR_B, head_a, head_b):
             return "B->A", branch_a, head_a, branch_b, head_b
-        if git_is_ancestor(DIR_A, head_b, head_a):
+        if git_is_ancestor_cross_repo(DIR_A, DIR_B, head_b, head_a):
             return "A->B", branch_a, head_a, branch_b, head_b
     # If baseline is missing (e.g. first run or state reset) and a git hook explicitly
     # fired on one side, honor the triggering hook's direction instead of deadlocking.
@@ -582,8 +750,8 @@ def decide_git_head_direction(
 def check_git_preconditions(
     prev_git: dict[str, Any],
     source: str | None,
-) -> tuple[bool, bool, tuple[str | None, str | None, str | None, str | None, str | None] | None]:
-    """Check Git state before touching working-tree files.
+) -> tuple[bool, bool, tuple[str, str | None, str | None, str | None, str | None] | None]:
+    """Check Git state before touching working-tree files (strictly read-only).
 
     Returns (should_defer, git_unchanged_fastpath, precomputed_decision).
     """
@@ -596,24 +764,30 @@ def check_git_preconditions(
         source is None
         and meta_a is not None
         and meta_b is not None
-        and prev_git.get("branch")
         and prev_git.get("head")
         and meta_a == prev_git.get("meta_a")
         and meta_b == prev_git.get("meta_b")
     ):
+        clear_alert("git")
         return False, True, None
 
     decision = decide_git_head_direction(prev_git, source)
     direction, branch_a, head_a, branch_b, head_b = decision
 
     if direction == "CONFLICT" and branch_a and branch_b and head_a and head_b:
-        log(
-            f"GIT defer: A={branch_a}@{head_a[:7]} vs B={branch_b}@{head_b[:7]} diverged; skipping sync to avoid split-brain",
-            err=True,
-        )
+        msg = f"A={branch_a}@{head_a[:7]} vs B={branch_b}@{head_b[:7]} diverged"
+        log(f"GIT defer: {msg}; skipping sync to avoid split-brain", err=True)
+        notify_once("git", f"conflict:{branch_a}@{head_a}|{branch_b}@{head_b}", "Folder Mirror Paused (Git Conflict)", msg)
         return True, False, decision
-    if direction is None and head_a and head_b and head_a != head_b:
-        log("GIT defer: detached HEAD mismatch detected; skipping sync to avoid split-brain", err=True)
+    if direction == "DETACHED_MISMATCH":
+        a_desc = f"{branch_a or 'detached'}@{head_a[:7] if head_a else 'none'}"
+        b_desc = f"{branch_b or 'detached'}@{head_b[:7] if head_b else 'none'}"
+        msg = f"A={a_desc} vs B={b_desc} detached HEAD mismatch"
+        log(f"GIT defer: {msg}; skipping sync to avoid split-brain", err=True)
+        notify_once("git", f"detached:{a_desc}|{b_desc}", "Folder Mirror Paused (Detached HEAD)", msg)
+        return True, False, decision
+    if direction == "UNBORN":
+        log("GIT defer: one or both repos have an unborn/missing HEAD", err=True)
         return True, False, decision
     if direction == "A->B" and git_has_staged_changes(DIR_B):
         log(f"GIT defer A->B: destination {DIR_B} has staged changes", err=True)
@@ -622,6 +796,7 @@ def check_git_preconditions(
         log(f"GIT defer B->A: destination {DIR_A} has staged changes", err=True)
         return True, False, decision
 
+    clear_alert("git")
     return False, False, decision
 
 
@@ -629,6 +804,7 @@ def apply_git_head(
     src: Path,
     dst: Path,
     src_branch: str,
+    src_head: str,
     dst_branch: str,
     label: str,
     actions: list[str],
@@ -637,30 +813,56 @@ def apply_git_head(
         log(f"GIT skip {label}: destination {dst} has staged changes", err=True)
         return False
 
-    r1 = git_run(dst, "fetch", "--quiet", "--no-tags", str(src), "HEAD", sync_guard=True)
+    # Fetch without writing FETCH_HEAD so user's FETCH_HEAD is never clobbered.
+    r1 = git_run(
+        dst,
+        "fetch",
+        "--quiet",
+        "--no-tags",
+        "--no-write-fetch-head",
+        str(src),
+        f"refs/heads/{src_branch}",
+        sync_guard=True,
+    )
     if r1.returncode != 0:
-        log(f"GIT error {label} fetch HEAD: {r1.stderr.strip()}", err=True)
+        log(f"GIT error {label} fetch refs/heads/{src_branch}: {r1.stderr.strip()}", err=True)
         return False
 
+    r_chk = git_run(dst, "cat-file", "-e", f"{src_head}^{{commit}}")
+    if r_chk.returncode != 0:
+        log(f"GIT error {label}: fetched commit {src_head[:7]} missing in {dst}", err=True)
+        return False
+
+    try:
+        write_json_atomic(
+            GIT_HEAD_RECOVERY_FILE,
+            {"dst": str(dst), "target_branch": src_branch, "target_head": src_head},
+        )
+    except OSError:
+        pass
+
     if src_branch != dst_branch:
-        r2 = git_run(dst, "update-ref", f"refs/heads/{src_branch}", "FETCH_HEAD", sync_guard=True)
+        r2 = git_run(dst, "update-ref", f"refs/heads/{src_branch}", src_head, sync_guard=True)
         if r2.returncode != 0:
             log(f"GIT error {label} update-ref {src_branch}: {r2.stderr.strip()}", err=True)
+            GIT_HEAD_RECOVERY_FILE.unlink(missing_ok=True)
             return False
         r3 = git_run(dst, "symbolic-ref", "HEAD", f"refs/heads/{src_branch}", sync_guard=True)
         if r3.returncode != 0:
             log(f"GIT error {label} symbolic-ref {src_branch}: {r3.stderr.strip()}", err=True)
+            GIT_HEAD_RECOVERY_FILE.unlink(missing_ok=True)
             return False
         r4 = git_run(dst, "reset", "--quiet", "--mixed", "HEAD", sync_guard=True)
         if r4.returncode != 0:
             log(f"GIT error {label} reset --mixed HEAD: {r4.stderr.strip()}", err=True)
             return False
     else:
-        r2 = git_run(dst, "reset", "--quiet", "--mixed", "FETCH_HEAD", sync_guard=True)
+        r2 = git_run(dst, "reset", "--quiet", "--mixed", src_head, sync_guard=True)
         if r2.returncode != 0:
-            log(f"GIT error {label} reset --mixed FETCH_HEAD: {r2.stderr.strip()}", err=True)
+            log(f"GIT error {label} reset --mixed {src_head[:7]}: {r2.stderr.strip()}", err=True)
             return False
 
+    GIT_HEAD_RECOVERY_FILE.unlink(missing_ok=True)
     new_head = git_out(dst, "rev-parse", "--short", "HEAD") or ""
     actions.append(f"GIT {label} {src_branch}@{new_head}")
     return True
@@ -674,7 +876,7 @@ def sync_ref_map(
     *,
     skip_refs: set[str] | None = None,
 ) -> tuple[dict[str, str], bool]:
-    """3-way sync a map of refs between DIR_A and DIR_B. Returns (new_refs, had_error)."""
+    """3-way sync a map of refs between DIR_A and DIR_B without mutating FETCH_HEAD."""
     skip = skip_refs or set()
     new_refs: dict[str, str] = {}
     had_error = False
@@ -700,7 +902,16 @@ def sync_ref_map(
             a_chg = oid_a != oid_p
             b_chg = oid_b != oid_p
             if a_chg and not b_chg:
-                r = git_run(DIR_B, "fetch", "--quiet", "--no-tags", str(DIR_A), f"+{ref}:{ref}", sync_guard=True)
+                r = git_run(
+                    DIR_B,
+                    "fetch",
+                    "--quiet",
+                    "--no-tags",
+                    "--no-write-fetch-head",
+                    str(DIR_A),
+                    f"+{ref}:{ref}",
+                    sync_guard=True,
+                )
                 if r.returncode == 0:
                     new_refs[ref] = oid_a
                     actions.append(f"GIT A->B {ref}->{oid_a[:7]}")
@@ -710,7 +921,16 @@ def sync_ref_map(
                     if oid_p:
                         new_refs[ref] = oid_p
             elif b_chg and not a_chg:
-                r = git_run(DIR_A, "fetch", "--quiet", "--no-tags", str(DIR_B), f"+{ref}:{ref}", sync_guard=True)
+                r = git_run(
+                    DIR_A,
+                    "fetch",
+                    "--quiet",
+                    "--no-tags",
+                    "--no-write-fetch-head",
+                    str(DIR_B),
+                    f"+{ref}:{ref}",
+                    sync_guard=True,
+                )
                 if r.returncode == 0:
                     new_refs[ref] = oid_b
                     actions.append(f"GIT B->A {ref}->{oid_b[:7]}")
@@ -720,27 +940,50 @@ def sync_ref_map(
                     if oid_p:
                         new_refs[ref] = oid_p
             else:
-                git_run(DIR_A, "fetch", "--quiet", "--no-tags", str(DIR_B), ref, sync_guard=True)
-                if git_is_ancestor(DIR_A, oid_a, oid_b):
-                    r = git_run(DIR_A, "fetch", "--quiet", "--no-tags", str(DIR_B), f"+{ref}:{ref}", sync_guard=True)
+                if git_is_ancestor_cross_repo(DIR_A, DIR_B, oid_a, oid_b):
+                    r = git_run(
+                        DIR_A,
+                        "fetch",
+                        "--quiet",
+                        "--no-tags",
+                        "--no-write-fetch-head",
+                        str(DIR_B),
+                        f"+{ref}:{ref}",
+                        sync_guard=True,
+                    )
                     if r.returncode == 0:
                         new_refs[ref] = oid_b
                         actions.append(f"GIT B->A {ref}->{oid_b[:7]}")
                     else:
                         had_error = True
+                        log(f"GIT error B->A fast-forward {ref}: {r.stderr.strip()}", err=True)
                         if oid_p:
                             new_refs[ref] = oid_p
-                elif git_is_ancestor(DIR_A, oid_b, oid_a):
-                    r = git_run(DIR_B, "fetch", "--quiet", "--no-tags", str(DIR_A), f"+{ref}:{ref}", sync_guard=True)
+                elif git_is_ancestor_cross_repo(DIR_A, DIR_B, oid_b, oid_a):
+                    r = git_run(
+                        DIR_B,
+                        "fetch",
+                        "--quiet",
+                        "--no-tags",
+                        "--no-write-fetch-head",
+                        str(DIR_A),
+                        f"+{ref}:{ref}",
+                        sync_guard=True,
+                    )
                     if r.returncode == 0:
                         new_refs[ref] = oid_a
                         actions.append(f"GIT A->B {ref}->{oid_a[:7]}")
                     else:
                         had_error = True
+                        log(f"GIT error A->B fast-forward {ref}: {r.stderr.strip()}", err=True)
                         if oid_p:
                             new_refs[ref] = oid_p
                 else:
                     had_error = True
+                    log(
+                        f"GIT conflict on {ref}: A={oid_a[:7]} vs B={oid_b[:7]} diverged; manual reconciliation needed",
+                        err=True,
+                    )
                     if oid_p:
                         new_refs[ref] = oid_p
         elif oid_a and not oid_b:
@@ -750,9 +993,19 @@ def sync_ref_map(
                     actions.append(f"GIT DEL A {ref}")
                 else:
                     had_error = True
+                    log(f"GIT error DEL A {ref}: {r.stderr.strip()}", err=True)
                     new_refs[ref] = oid_p
             else:
-                r = git_run(DIR_B, "fetch", "--quiet", "--no-tags", str(DIR_A), f"+{ref}:{ref}", sync_guard=True)
+                r = git_run(
+                    DIR_B,
+                    "fetch",
+                    "--quiet",
+                    "--no-tags",
+                    "--no-write-fetch-head",
+                    str(DIR_A),
+                    f"+{ref}:{ref}",
+                    sync_guard=True,
+                )
                 if r.returncode == 0:
                     new_refs[ref] = oid_a
                     actions.append(f"GIT A->B {ref}->{oid_a[:7]}")
@@ -766,9 +1019,19 @@ def sync_ref_map(
                     actions.append(f"GIT DEL B {ref}")
                 else:
                     had_error = True
+                    log(f"GIT error DEL B {ref}: {r.stderr.strip()}", err=True)
                     new_refs[ref] = oid_p
             else:
-                r = git_run(DIR_A, "fetch", "--quiet", "--no-tags", str(DIR_B), f"+{ref}:{ref}", sync_guard=True)
+                r = git_run(
+                    DIR_A,
+                    "fetch",
+                    "--quiet",
+                    "--no-tags",
+                    "--no-write-fetch-head",
+                    str(DIR_B),
+                    f"+{ref}:{ref}",
+                    sync_guard=True,
+                )
                 if r.returncode == 0:
                     new_refs[ref] = oid_b
                     actions.append(f"GIT B->A {ref}->{oid_b[:7]}")
@@ -803,37 +1066,49 @@ def sync_branch_tracking_configs(
         a_chg = tr_a != tr_p
         b_chg = tr_b != tr_p
         if a_chg and not b_chg:
-            if set_branch_tracking(DIR_B, branch, tr_a):
+            ok, err = set_branch_tracking(DIR_B, branch, tr_a)
+            if ok:
                 if tr_a is not None:
                     new_tracking[branch] = tr_a
                 actions.append(f"GIT A->B tracking {branch}")
             else:
                 had_error = True
+                log(f"GIT error A->B tracking {branch}: {err}", err=True)
                 if tr_p is not None:
                     new_tracking[branch] = tr_p
         elif b_chg and not a_chg:
-            if set_branch_tracking(DIR_A, branch, tr_b):
+            ok, err = set_branch_tracking(DIR_A, branch, tr_b)
+            if ok:
                 if tr_b is not None:
                     new_tracking[branch] = tr_b
                 actions.append(f"GIT B->A tracking {branch}")
             else:
                 had_error = True
+                log(f"GIT error B->A tracking {branch}: {err}", err=True)
                 if tr_p is not None:
                     new_tracking[branch] = tr_p
         elif tr_a is not None and tr_b is None:
-            if set_branch_tracking(DIR_B, branch, tr_a):
+            ok, err = set_branch_tracking(DIR_B, branch, tr_a)
+            if ok:
                 new_tracking[branch] = tr_a
                 actions.append(f"GIT A->B tracking {branch}")
             else:
                 had_error = True
+                log(f"GIT error A->B tracking {branch}: {err}", err=True)
         elif tr_b is not None and tr_a is None:
-            if set_branch_tracking(DIR_A, branch, tr_b):
+            ok, err = set_branch_tracking(DIR_A, branch, tr_b)
+            if ok:
                 new_tracking[branch] = tr_b
                 actions.append(f"GIT B->A tracking {branch}")
             else:
                 had_error = True
+                log(f"GIT error B->A tracking {branch}: {err}", err=True)
         else:
             had_error = True
+            log(
+                f"GIT conflict on branch.{branch} tracking config: A={tr_a} vs B={tr_b}; manual reconciliation needed",
+                err=True,
+            )
             if tr_p is not None:
                 new_tracking[branch] = tr_p
 
@@ -842,7 +1117,7 @@ def sync_branch_tracking_configs(
 
 def sync_git_state(
     prev_git: dict[str, Any],
-    precomputed: tuple[str | None, str | None, str | None, str | None, str | None],
+    precomputed: tuple[str, str | None, str | None, str | None, str | None],
     actions: list[str],
 ) -> dict[str, Any]:
     """Keep both local git repos aligned (HEAD, all local branches, remotes, tags, tracking)."""
@@ -868,21 +1143,25 @@ def sync_git_state(
         new_git["branch"] = branch_a
         new_git["head"] = head_a
         active_branch = branch_a
+    elif direction == "DETACHED_EQUAL" and head_a:
+        new_git["branch"] = None
+        new_git["head"] = head_a
     elif direction == "A->B" and branch_a and branch_b and head_a:
-        if apply_git_head(DIR_A, DIR_B, branch_a, branch_b, "A->B", actions):
+        if apply_git_head(DIR_A, DIR_B, branch_a, head_a, branch_b, "A->B", actions):
             new_git["branch"] = branch_a
             new_git["head"] = head_a
             active_branch = branch_a
         else:
             had_error = True
     elif direction == "B->A" and branch_a and branch_b and head_b:
-        if apply_git_head(DIR_B, DIR_A, branch_b, branch_a, "B->A", actions):
+        if apply_git_head(DIR_B, DIR_A, branch_b, head_b, branch_a, "B->A", actions):
             new_git["branch"] = branch_b
             new_git["head"] = head_b
             active_branch = branch_b
         else:
             had_error = True
     else:
+        log(f"GIT error: unexpected HEAD sync state direction={direction!r}", err=True)
         had_error = True
 
     skip_heads: set[str] = set()
@@ -941,21 +1220,93 @@ def acquire_lock(lock_fh: Any, wait_seconds: float) -> bool:
             time.sleep(0.05)
 
 
-def sync(*, wait_seconds: float = 0.0, source: str | None = None) -> int:
+def rename_dir_case(root: Path, old_rel: str, new_rel: str) -> bool:
+    """Two-step case-only rename on APFS so directory casing matches canonical target."""
+    src = root / old_rel
+    dst = root / new_rel
+    if not src.is_dir() or src.is_symlink():
+        return False
+    tmp = src.parent / f"{TEMP_PREFIX}{os.getpid()}.{secrets.token_hex(6)}{TEMP_SUFFIX}"
+    try:
+        os.rename(src, tmp)
+        try:
+            os.rename(tmp, dst)
+        except OSError:
+            os.rename(tmp, src)
+            raise
+        return True
+    except OSError as exc:
+        log(f"Error CASE-NORM {src} -> {dst}: {exc}", err=True)
+        return False
+
+
+def reconcile_dir_case_collisions(
+    dirs_a: set[str],
+    dirs_b: set[str],
+    prev_dirs: set[str],
+    actions: list[str],
+) -> bool:
+    """Normalize APFS directory-segment case collisions shallowest-first before file planning.
+
+    Returns True if any directory was renamed (caller should re-scan).
+    """
+    cf_a: dict[str, str] = {d.casefold(): d for d in dirs_a}
+    cf_b: dict[str, str] = {d.casefold(): d for d in dirs_b}
+    common_cf = sorted(set(cf_a) & set(cf_b), key=lambda x: (x.count("/"), x))
+    for cf in common_cf:
+        da, db = cf_a[cf], cf_b[cf]
+        if da == db:
+            continue
+        # Only normalize the shallowest differing segment first; re-scan updates children.
+        if Path(da).parent.as_posix() != Path(db).parent.as_posix():
+            continue
+        if da in prev_dirs and db not in prev_dirs:
+            # B renamed da -> db
+            if rename_dir_case(DIR_A, da, db):
+                actions.append(f"CASE-NORM A {da} -> {db}")
+                return True
+        elif db in prev_dirs and da not in prev_dirs:
+            # A renamed db -> da
+            if rename_dir_case(DIR_B, db, da):
+                actions.append(f"CASE-NORM B {db} -> {da}")
+                return True
+        else:
+            # Both created or both in prev with different casing: newer dir mtime wins (tie -> A).
+            try:
+                st_a = (DIR_A / da).lstat()
+                st_b = (DIR_B / db).lstat()
+                a_wins = (st_a.st_mtime_ns, st_a.st_ctime_ns) >= (st_b.st_mtime_ns, st_b.st_ctime_ns)
+            except OSError:
+                a_wins = True
+            if a_wins:
+                if rename_dir_case(DIR_B, db, da):
+                    actions.append(f"CASE-NORM B {db} -> {da}")
+                    return True
+            else:
+                if rename_dir_case(DIR_A, da, db):
+                    actions.append(f"CASE-NORM A {da} -> {db}")
+                    return True
+    return False
+
+
+def sync_once(*, wait_seconds: float = 0.0, source: str | None = None) -> tuple[int, bool]:
+    """Run one sync pass. Returns (exit_code, busy_deferred)."""
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     with LOCK_FILE.open("a+") as lock_fh:
         if not acquire_lock(lock_fh, wait_seconds):
             if wait_seconds > 0:
                 log(f"Skipping sync: lock busy after {wait_seconds:.1f}s", err=True)
-            return 0
+            return 0, True
 
         if not DIR_A.exists() or not DIR_B.exists():
             log(f"Skipping sync: missing directory ({DIR_A.exists()=}, {DIR_B.exists()=})", err=True)
-            return 1
+            return 1, False
 
         # Defer the ENTIRE sync if either repo is mid-git-operation (commit/merge/rebase/checkout).
         if is_git_busy(DIR_A) or is_git_busy(DIR_B):
-            return 0
+            return 0, True
+
+        recover_interrupted_git_head()
 
         prev_state = load_state()
         prev_files: dict[str, dict[str, Any]] = prev_state["files"]
@@ -965,14 +1316,22 @@ def sync(*, wait_seconds: float = 0.0, source: str | None = None) -> int:
         # Defer before mutating working trees if Git HEAD is diverged, detached, or staged-conflicted.
         should_defer, git_fastpath, precomputed_git = check_git_preconditions(prev_git, source)
         if should_defer:
-            return 0
+            return 0, False
 
+        actions: list[str] = []
         snap_a, dirs_a = scan_dir(DIR_A, "a", prev_files)
         snap_b, dirs_b = scan_dir(DIR_B, "b", prev_files)
 
+        # Reconcile APFS directory-level case collisions (e.g. Foo/a.txt vs foo/b.txt) before planning.
+        for _ in range(10):
+            if not reconcile_dir_case_collisions(dirs_a, dirs_b, prev_dirs, actions):
+                break
+            snap_a, dirs_a = scan_dir(DIR_A, "a", prev_files)
+            snap_b, dirs_b = scan_dir(DIR_B, "b", prev_files)
+
         all_paths = sorted(set(snap_a) | set(snap_b) | set(prev_files))
-        actions: list[str] = []
         new_files: dict[str, dict[str, Any]] = {}
+        collision_errors: list[str] = []
 
         # Plan operations so deletions run before copies (prevents file<->dir & case collisions).
         deletes: list[tuple[str, Path, str]] = []
@@ -1059,6 +1418,7 @@ def sync(*, wait_seconds: float = 0.0, source: str | None = None) -> int:
                 actions.append(f"{label} {rel}")
             except OSError as exc:
                 log(f"Error {label} {rel}: {exc}", err=True)
+                collision_errors.append(f"del:{rel}")
                 if rel in prev_files:
                     new_files[rel] = prev_files[rel]
 
@@ -1122,12 +1482,15 @@ def sync(*, wait_seconds: float = 0.0, source: str | None = None) -> int:
                 new_files[rel] = entry
             except OSError as exc:
                 log(f"Error {action_label}: {exc}", err=True)
+                collision_errors.append(f"copy:{rel}")
                 if rel in prev_files:
                     new_files[rel] = prev_files[rel]
 
         # Phase 3: Create missing directories (including empty directories) shallowest-first.
         file_parents: set[str] = set()
+        new_files_cf: set[str] = set()
         for rel in new_files:
+            new_files_cf.add(rel.casefold())
             p = Path(rel).parent
             while str(p) != ".":
                 file_parents.add(p.as_posix())
@@ -1135,25 +1498,51 @@ def sync(*, wait_seconds: float = 0.0, source: str | None = None) -> int:
 
         new_dirs: set[str] = set(file_parents) | kept_nonempty_dirs
         for d in sorted(all_dirs, key=lambda x: (x.count("/"), x)):
+            if d in new_files or d.casefold() in new_files_cf:
+                continue
             in_a = d in dirs_a
             in_b = d in dirs_b
             in_p = d in prev_dirs
             if in_a and in_b:
                 new_dirs.add(d)
             elif in_a and not in_b and not in_p:
+                target = DIR_B / d
+                if target.is_symlink() or target.is_file():
+                    log(f"Collision MKDIR B {d}: non-directory exists at {target}", err=True)
+                    collision_errors.append(f"mkdir-b:{d}")
+                    continue
                 try:
-                    (DIR_B / d).mkdir(parents=True, exist_ok=True)
+                    target.mkdir(parents=True, exist_ok=True)
                     new_dirs.add(d)
                     actions.append(f"MKDIR B {d}")
                 except OSError as exc:
                     log(f"Error MKDIR B {d}: {exc}", err=True)
+                    collision_errors.append(f"mkdir-b:{d}")
             elif in_b and not in_a and not in_p:
+                target = DIR_A / d
+                if target.is_symlink() or target.is_file():
+                    log(f"Collision MKDIR A {d}: non-directory exists at {target}", err=True)
+                    collision_errors.append(f"mkdir-a:{d}")
+                    continue
                 try:
-                    (DIR_A / d).mkdir(parents=True, exist_ok=True)
+                    target.mkdir(parents=True, exist_ok=True)
                     new_dirs.add(d)
                     actions.append(f"MKDIR A {d}")
                 except OSError as exc:
                     log(f"Error MKDIR A {d}: {exc}", err=True)
+                    collision_errors.append(f"mkdir-a:{d}")
+
+        if collision_errors:
+            key = "|".join(sorted(set(collision_errors)))
+            sample = ", ".join(sorted(set(collision_errors))[:3])
+            notify_once(
+                "collision",
+                key,
+                "Folder Mirror Path Collision",
+                f"Manual check needed for: {sample} (see sync.err.log)",
+            )
+        else:
+            clear_alert("collision")
 
         if git_fastpath or precomputed_git is None:
             new_git = prev_git
@@ -1174,8 +1563,251 @@ def sync(*, wait_seconds: float = 0.0, source: str | None = None) -> int:
 
         rotate_log_file(LOG_FILE)
         rotate_log_file(ERR_LOG_FILE)
-        rotate_log_file(LAUNCHD_LOG_FILE)
-        rotate_log_file(LAUNCHD_ERR_LOG_FILE)
+        rotate_copytruncate_log_file(LAUNCHD_LOG_FILE)
+        rotate_copytruncate_log_file(LAUNCHD_ERR_LOG_FILE)
+
+    return 0, False
+
+
+def sync(*, wait_seconds: float = 0.0, source: str | None = None) -> int:
+    code, _ = sync_once(wait_seconds=wait_seconds, source=source)
+    return code
+
+
+def watch_loop() -> int:
+    """Recursive real-time macOS FSEvents daemon with periodic safety reconciliation."""
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    with WATCH_LOCK_FILE.open("a+") as watch_lock_fh:
+        if not acquire_lock(watch_lock_fh, 0.0):
+            log("Watch daemon already running; exiting duplicate instance", err=True)
+            return 0
+
+        stop_requested = False
+
+        def handle_signal(signum: int, _frame: Any) -> None:
+            nonlocal stop_requested
+            stop_requested = True
+
+        signal.signal(signal.SIGTERM, handle_signal)
+        signal.signal(signal.SIGINT, handle_signal)
+
+        # Initial startup sync before waiting on FSEvents.
+        _, busy = sync_once(wait_seconds=5.0)
+
+        if sys.platform != "darwin":
+            log("Non-macOS platform detected; falling back to 30s polling loop")
+            while not stop_requested:
+                time.sleep(30.0)
+                if not stop_requested:
+                    sync_once(wait_seconds=2.0)
+            return 0
+
+        cf = ctypes.CDLL("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation")
+        cs = ctypes.CDLL("/System/Library/Frameworks/CoreServices.framework/CoreServices")
+
+        kCFStringEncodingUTF8 = 0x08000100
+        kFSEventStreamEventIdSinceNow = 0xFFFFFFFFFFFFFFFF
+        kFSEventStreamCreateFlagWatchRoot = 0x00000004
+        kFSEventStreamCreateFlagIgnoreSelf = 0x00000008
+        kFSEventStreamCreateFlagFileEvents = 0x00000010
+        kFSEventStreamEventFlagRootChanged = 0x00000020
+
+        cf.CFStringCreateWithCString.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint32]
+        cf.CFStringCreateWithCString.restype = ctypes.c_void_p
+        cf.CFArrayCreate.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.c_long,
+            ctypes.c_void_p,
+        ]
+        cf.CFArrayCreate.restype = ctypes.c_void_p
+        cf.CFRelease.argtypes = [ctypes.c_void_p]
+        cf.CFRelease.restype = None
+        cf.CFRunLoopGetCurrent.argtypes = []
+        cf.CFRunLoopGetCurrent.restype = ctypes.c_void_p
+        cf.CFRunLoopRunInMode.argtypes = [ctypes.c_void_p, ctypes.c_double, ctypes.c_bool]
+        cf.CFRunLoopRunInMode.restype = ctypes.c_int32
+        cf.CFRunLoopStop.argtypes = [ctypes.c_void_p]
+        cf.CFRunLoopStop.restype = None
+
+        kCFTypeArrayCallBacks = ctypes.c_void_p.in_dll(cf, "kCFTypeArrayCallBacks")
+        kCFRunLoopDefaultMode = ctypes.c_void_p.in_dll(cf, "kCFRunLoopDefaultMode")
+
+        callback_type = ctypes.CFUNCTYPE(
+            None,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+            ctypes.POINTER(ctypes.c_char_p),
+            ctypes.POINTER(ctypes.c_uint32),
+            ctypes.POINTER(ctypes.c_uint64),
+        )
+
+        cs.FSEventStreamCreate.argtypes = [
+            ctypes.c_void_p,
+            callback_type,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_uint64,
+            ctypes.c_double,
+            ctypes.c_uint32,
+        ]
+        cs.FSEventStreamCreate.restype = ctypes.c_void_p
+        cs.FSEventStreamScheduleWithRunLoop.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
+        cs.FSEventStreamScheduleWithRunLoop.restype = None
+        cs.FSEventStreamStart.argtypes = [ctypes.c_void_p]
+        cs.FSEventStreamStart.restype = ctypes.c_bool
+        cs.FSEventStreamStop.argtypes = [ctypes.c_void_p]
+        cs.FSEventStreamStop.restype = None
+        cs.FSEventStreamInvalidate.argtypes = [ctypes.c_void_p]
+        cs.FSEventStreamInvalidate.restype = None
+        cs.FSEventStreamRelease.argtypes = [ctypes.c_void_p]
+        cs.FSEventStreamRelease.restype = None
+
+        run_loop = cf.CFRunLoopGetCurrent()
+        dirty = False
+        git_dirty = False
+        restart_stream = False
+        root_a_git = str((DIR_A.resolve() / ".git"))
+        root_b_git = str((DIR_B.resolve() / ".git"))
+
+        def is_git_internal_path(raw: bytes | None) -> bool:
+            if not raw:
+                return False
+            p = raw.decode("utf-8", errors="surrogateescape")
+            return (
+                p == root_a_git
+                or p.startswith(root_a_git + "/")
+                or p == root_b_git
+                or p.startswith(root_b_git + "/")
+            )
+
+        @callback_type
+        def on_fsevents(
+            _stream_ref: Any,
+            _info: Any,
+            num_events: int,
+            event_paths: Any,
+            event_flags: Any,
+            _event_ids: Any,
+        ) -> None:
+            nonlocal dirty, git_dirty, restart_stream
+            try:
+                saw_non_git = False
+                for i in range(num_events):
+                    if int(event_flags[i]) & kFSEventStreamEventFlagRootChanged:
+                        restart_stream = True
+                        saw_non_git = True
+                    elif not is_git_internal_path(event_paths[i]):
+                        saw_non_git = True
+                if saw_non_git:
+                    dirty = True
+                else:
+                    git_dirty = True
+                cf.CFRunLoopStop(run_loop)
+            except Exception:
+                dirty = True
+
+        def create_stream() -> Any:
+            paths = [str(DIR_A.resolve()), str(DIR_B.resolve())]
+            cf_strings: list[Any] = []
+            for p in paths:
+                s = cf.CFStringCreateWithCString(None, p.encode("utf-8"), kCFStringEncodingUTF8)
+                if not s:
+                    for prev_s in cf_strings:
+                        cf.CFRelease(prev_s)
+                    return None
+                cf_strings.append(s)
+            arr_vals = (ctypes.c_void_p * len(cf_strings))(*cf_strings)
+            cf_arr = cf.CFArrayCreate(None, arr_vals, len(cf_strings), ctypes.byref(kCFTypeArrayCallBacks))
+            if not cf_arr:
+                for s in cf_strings:
+                    cf.CFRelease(s)
+                return None
+            stream_ref = cs.FSEventStreamCreate(
+                None,
+                on_fsevents,
+                None,
+                cf_arr,
+                kFSEventStreamEventIdSinceNow,
+                WATCH_LATENCY_SECONDS,
+                kFSEventStreamCreateFlagWatchRoot
+                | kFSEventStreamCreateFlagIgnoreSelf
+                | kFSEventStreamCreateFlagFileEvents,
+            )
+            cf.CFRelease(cf_arr)
+            for s in cf_strings:
+                cf.CFRelease(s)
+            if not stream_ref:
+                return None
+            cs.FSEventStreamScheduleWithRunLoop(stream_ref, run_loop, kCFRunLoopDefaultMode)
+            if not cs.FSEventStreamStart(stream_ref):
+                cs.FSEventStreamInvalidate(stream_ref)
+                cs.FSEventStreamRelease(stream_ref)
+                return None
+            return stream_ref
+
+        def destroy_stream(stream_ref: Any) -> None:
+            if stream_ref:
+                cs.FSEventStreamStop(stream_ref)
+                cs.FSEventStreamInvalidate(stream_ref)
+                cs.FSEventStreamRelease(stream_ref)
+
+        stream = create_stream()
+        if not stream:
+            log("Failed to start macOS FSEvents stream; falling back to 30s polling loop", err=True)
+            while not stop_requested:
+                time.sleep(30.0)
+                if not stop_requested:
+                    sync_once(wait_seconds=2.0)
+            return 0
+
+        next_reconcile = time.monotonic() + WATCH_RECONCILE_SECONDS
+        busy_retry_at = (time.monotonic() + WATCH_BUSY_RETRY_SECONDS) if busy else 0.0
+        last_git_metas = (git_meta_fingerprint(DIR_A), git_meta_fingerprint(DIR_B))
+
+        try:
+            while not stop_requested:
+                now = time.monotonic()
+                timeout = WATCH_RUNLOOP_SLICE_SECONDS
+                if busy_retry_at > 0.0:
+                    timeout = min(timeout, max(0.05, busy_retry_at - now))
+                cf.CFRunLoopRunInMode(kCFRunLoopDefaultMode, timeout, True)
+                if stop_requested:
+                    break
+
+                now = time.monotonic()
+                if restart_stream:
+                    restart_stream = False
+                    destroy_stream(stream)
+                    stream = create_stream()
+                    if not stream:
+                        log("Failed to restart FSEvents stream after root change", err=True)
+                        return 1
+                    dirty = True
+
+                # Suppress self-echo FSEvents from child git subprocesses when .git metadata is unchanged.
+                if git_dirty and not dirty:
+                    git_dirty = False
+                    cur_git_metas = (git_meta_fingerprint(DIR_A), git_meta_fingerprint(DIR_B))
+                    if cur_git_metas != last_git_metas or cur_git_metas[0] is None or cur_git_metas[1] is None:
+                        dirty = True
+
+                should_run = dirty or (busy_retry_at > 0.0 and now >= busy_retry_at) or now >= next_reconcile
+                if should_run:
+                    dirty = False
+                    git_dirty = False
+                    try:
+                        _, busy = sync_once(wait_seconds=2.0)
+                    except Exception as exc:
+                        log(f"Unexpected error in watch sync pass: {exc}", err=True)
+                        busy = False
+                    last_git_metas = (git_meta_fingerprint(DIR_A), git_meta_fingerprint(DIR_B))
+                    now = time.monotonic()
+                    busy_retry_at = (now + WATCH_BUSY_RETRY_SECONDS) if busy else 0.0
+                    next_reconcile = now + WATCH_RECONCILE_SECONDS
+        finally:
+            destroy_stream(stream)
 
     return 0
 
@@ -1194,9 +1826,32 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         default=None,
         help="Hint indicating which side triggered the sync (used by git hooks).",
     )
+    parser.add_argument(
+        "--dir-a",
+        type=str,
+        default=None,
+        help="Path to Folder A (overrides MIRROR_DIR_A).",
+    )
+    parser.add_argument(
+        "--dir-b",
+        type=str,
+        default=None,
+        help="Path to Folder B (overrides MIRROR_DIR_B).",
+    )
+    parser.add_argument(
+        "--watch",
+        action="store_true",
+        help="Run continuously and mirror edits in real time.",
+    )
     return parser.parse_args(argv)
 
 
 if __name__ == "__main__":
     args = parse_args(sys.argv[1:])
+    if args.dir_a:
+        DIR_A = Path(args.dir_a).expanduser()
+    if args.dir_b:
+        DIR_B = Path(args.dir_b).expanduser()
+    if args.watch:
+        sys.exit(watch_loop())
     sys.exit(sync(wait_seconds=args.wait, source=args.source))
