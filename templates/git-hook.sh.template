@@ -1,0 +1,5 @@
+#!/bin/sh
+export MIRROR_DIR_A="{{DIR_A}}"
+export MIRROR_DIR_B="{{DIR_B}}"
+[ "${FOLDER_MIRROR_GIT_SYNC:-0}" = "1" ] && exit 0
+/opt/homebrew/bin/python3 $HOME/.local/bin/folder-mirror --wait 10 --source {{SIDE}} >>$HOME/.local/state/folder-mirror/sync.log 2>>$HOME/.local/state/folder-mirror/sync.err.log || true

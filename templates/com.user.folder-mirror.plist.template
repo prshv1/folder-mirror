@@ -9,14 +9,27 @@
         <string>{{PYTHON3}}</string>
         <string>{{HOME}}/.local/bin/folder-mirror</string>
     </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/bin:/bin</string>
+        <key>MIRROR_DIR_A</key>
+        <string>{{DIR_A}}</string>
+        <key>MIRROR_DIR_B</key>
+        <string>{{DIR_B}}</string>
+    </dict>
     <key>WatchPaths</key>
     <array>
         <string>{{DIR_A}}</string>
         <string>{{DIR_B}}</string>
     </array>
     <key>StartInterval</key>
-    <integer>5</integer>
+    <integer>30</integer>
     <key>RunAtLoad</key>
+    <true/>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>LowPriorityIO</key>
     <true/>
     <key>StandardOutPath</key>
     <string>{{HOME}}/.local/state/folder-mirror/sync.log</string>

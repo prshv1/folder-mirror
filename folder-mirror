@@ -1,196 +1,727 @@
 #!/usr/bin/env python3
-"""Two-way folder mirror for macOS."""
+"""Real-time two-way folder mirror for macOS."""
 
 from __future__ import annotations
 
+import argparse
 import datetime
 import fcntl
 import hashlib
 import json
 import os
+import secrets
 import shutil
+import subprocess
 import sys
+import tempfile
+import time
 from pathlib import Path
+from typing import Any
 
 DIR_A = Path(os.environ.get("MIRROR_DIR_A", str(Path.home() / "folder-a"))).expanduser()
 DIR_B = Path(os.environ.get("MIRROR_DIR_B", str(Path.home() / "folder-b"))).expanduser()
 STATE_DIR = Path(os.environ.get("FOLDER_MIRROR_STATE_DIR", str(Path.home() / ".local/state/folder-mirror"))).expanduser()
 STATE_FILE = STATE_DIR / "state.json"
 LOCK_FILE = STATE_DIR / "sync.lock"
+LOG_FILE = STATE_DIR / "sync.log"
+ERR_LOG_FILE = STATE_DIR / "sync.err.log"
 
-EXCLUDED_NAMES = {
-    ".git",
-    ".system",
-    ".obsidian",
-    ".DS_Store",
-}
+MAX_LOG_BYTES = 256 * 1024
+TRIM_LOG_BYTES = 128 * 1024
+
+# Only exclude .git internals from raw file copying; git refs are synced safely via git commands.
+EXCLUDED_NAMES = {".git"}
+TEMP_PREFIX = ".folder-mirror."
+TEMP_SUFFIX = ".tmp"
+
+# Any of these markers inside .git/ indicate an active git operation; defer the whole sync.
+GIT_BUSY_MARKERS = (
+    "index.lock",
+    "HEAD.lock",
+    "MERGE_HEAD",
+    "REBASE_HEAD",
+    "CHERRY_PICK_HEAD",
+    "REVERT_HEAD",
+    "BISECT_LOG",
+    "rebase-merge",
+    "rebase-apply",
+)
+
+
+def is_temp_name(name: str) -> bool:
+    return name.startswith(TEMP_PREFIX) and name.endswith(TEMP_SUFFIX)
 
 
 def is_excluded(rel_parts: tuple[str, ...]) -> bool:
-    for part in rel_parts:
-        if part in EXCLUDED_NAMES or part.startswith("._") or part.endswith(".obsidian"):
-            return True
-    return False
+    return any(part in EXCLUDED_NAMES or is_temp_name(part) for part in rel_parts)
 
 
-def file_signature(path: Path) -> dict[str, object]:
+def log(msg: str, *, err: bool = False) -> None:
+    ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    stream = sys.stderr if err else sys.stdout
+    print(f"[{ts}] {msg}", file=stream, flush=True)
+
+
+def trim_log_file(path: Path) -> None:
+    try:
+        if not path.exists():
+            return
+        size = path.stat().st_size
+        if size <= MAX_LOG_BYTES:
+            return
+        with path.open("r+b") as fh:
+            fh.seek(max(0, size - TRIM_LOG_BYTES))
+            tail = fh.read()
+            nl = tail.find(b"\n")
+            if nl != -1 and nl + 1 < len(tail):
+                tail = tail[nl + 1 :]
+            fh.seek(0)
+            fh.write(tail)
+            fh.truncate()
+    except OSError:
+        pass
+
+
+def stat_meta(st: os.stat_result, entry_type: str) -> dict[str, int]:
+    if entry_type == "symlink":
+        return {"mtime_ns": st.st_mtime_ns}
+    return {"mtime_ns": st.st_mtime_ns, "size": st.st_size}
+
+
+def file_signature(
+    path: Path,
+    side: str,
+    cached: dict[str, Any] | None,
+) -> dict[str, Any]:
     st = path.lstat()
     if path.is_symlink():
         target = os.readlink(path)
         digest = hashlib.sha256(f"symlink:{target}".encode("utf-8")).hexdigest()
-        return {"type": "symlink", "target": target, "hash": digest, "mtime": st.st_mtime}
-    h = hashlib.sha256()
-    with path.open("rb") as f:
-        for chunk in iter(lambda: f.read(65536), b""):
-            h.update(chunk)
-    return {"type": "file", "hash": h.hexdigest(), "mtime": st.st_mtime}
+        return {
+            "type": "symlink",
+            "target": target,
+            "hash": digest,
+            "mtime_ns": st.st_mtime_ns,
+            "meta": stat_meta(st, "symlink"),
+        }
+
+    meta = stat_meta(st, "file")
+    if (
+        cached is not None
+        and cached.get("type") == "file"
+        and cached.get(side) == meta
+        and isinstance(cached.get("hash"), str)
+    ):
+        digest = cached["hash"]
+    else:
+        h = hashlib.sha256()
+        with path.open("rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                h.update(chunk)
+        digest = h.hexdigest()
+
+    return {
+        "type": "file",
+        "hash": digest,
+        "mtime_ns": st.st_mtime_ns,
+        "meta": meta,
+    }
 
 
-def scan_dir(root: Path) -> dict[str, dict[str, object]]:
-    entries: dict[str, dict[str, object]] = {}
+def scan_dir(
+    root: Path,
+    side: str,
+    prev_files: dict[str, dict[str, Any]],
+) -> tuple[dict[str, dict[str, Any]], set[str]]:
+    entries: dict[str, dict[str, Any]] = {}
+    dirs: set[str] = set()
     if not root.exists():
-        return entries
+        return entries, dirs
+
     for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
         rel_dir = Path(dirpath).relative_to(root)
-        # Prune excluded directories in-place
-        dirnames[:] = [
-            d for d in dirnames
-            if not is_excluded(rel_dir.parts + (d,))
-        ]
+        if str(rel_dir) != ".":
+            dirs.add(rel_dir.as_posix())
+
+        kept_dirs: list[str] = []
+        for d in dirnames:
+            rel_path = rel_dir / d if str(rel_dir) != "." else Path(d)
+            if is_excluded(rel_path.parts):
+                continue
+            full_path = root / rel_path
+            if full_path.is_symlink():
+                rel_str = rel_path.as_posix()
+                try:
+                    entries[rel_str] = file_signature(full_path, side, prev_files.get(rel_str))
+                except FileNotFoundError:
+                    continue
+            else:
+                kept_dirs.append(d)
+        dirnames[:] = kept_dirs
+
         for name in filenames:
             rel_path = rel_dir / name if str(rel_dir) != "." else Path(name)
             if is_excluded(rel_path.parts):
                 continue
             full_path = root / rel_path
+            rel_str = rel_path.as_posix()
             try:
-                entries[rel_path.as_posix()] = file_signature(full_path)
+                entries[rel_str] = file_signature(full_path, side, prev_files.get(rel_str))
             except FileNotFoundError:
                 continue
-    return entries
+
+    return entries, dirs
 
 
-def copy_entry(src_root: Path, dst_root: Path, rel: str) -> None:
+def copy_entry(src_root: Path, dst_root: Path, rel: str) -> tuple[str, str, dict[str, int]]:
+    """Atomically copy a file or symlink from src_root/rel to dst_root/rel.
+
+    Returns (entry_type, content_hash, dst_stat_meta).
+    Raises OSError if destination is a non-empty directory or copy fails.
+    """
     src = src_root / rel
     dst = dst_root / rel
     dst.parent.mkdir(parents=True, exist_ok=True)
-    if dst.exists() or dst.is_symlink():
-        if dst.is_dir() and not dst.is_symlink():
-            shutil.rmtree(dst)
-        else:
-            dst.unlink()
+
+    # Never destructively rmtree a non-empty directory on a file<->dir collision.
+    if dst.is_dir() and not dst.is_symlink():
+        if any(dst.iterdir()):
+            raise IsADirectoryError(f"Destination is a non-empty directory: {dst}")
+        dst.rmdir()
+
     if src.is_symlink():
-        os.symlink(os.readlink(src), dst)
-    else:
-        shutil.copy2(src, dst)
+        target = os.readlink(src)
+        digest = hashlib.sha256(f"symlink:{target}".encode("utf-8")).hexdigest()
+        tmp_path = dst.parent / f"{TEMP_PREFIX}{os.getpid()}.{secrets.token_hex(6)}{TEMP_SUFFIX}"
+        try:
+            os.symlink(target, tmp_path)
+            os.replace(tmp_path, dst)
+        except Exception:
+            if tmp_path.is_symlink() or tmp_path.exists():
+                tmp_path.unlink(missing_ok=True)
+            raise
+        return "symlink", digest, stat_meta(dst.lstat(), "symlink")
+
+    h = hashlib.sha256()
+    fd, tmp_name = tempfile.mkstemp(
+        dir=dst.parent,
+        prefix=f"{TEMP_PREFIX}{os.getpid()}.",
+        suffix=TEMP_SUFFIX,
+    )
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "wb") as dst_fh, src.open("rb") as src_fh:
+            for chunk in iter(lambda: src_fh.read(65536), b""):
+                h.update(chunk)
+                dst_fh.write(chunk)
+        shutil.copystat(src, tmp_path)
+        os.replace(tmp_path, dst)
+    except Exception:
+        tmp_path.unlink(missing_ok=True)
+        raise
+
+    return "file", h.hexdigest(), stat_meta(dst.lstat(), "file")
 
 
 def remove_entry(root: Path, rel: str) -> None:
     target = root / rel
-    if target.exists() or target.is_symlink():
-        if target.is_dir() and not target.is_symlink():
-            shutil.rmtree(target)
-        else:
-            target.unlink()
-    # Prune now-empty parent directories up to root
-    parent = target.parent
-    while parent != root and parent.exists():
-        try:
-            parent.rmdir()
-        except OSError:
-            break
-        parent = parent.parent
+    if target.is_symlink() or target.is_file():
+        target.unlink(missing_ok=True)
+    elif target.is_dir():
+        if any(target.iterdir()):
+            raise IsADirectoryError(f"Refusing to remove non-empty directory: {target}")
+        target.rmdir()
 
 
-def load_state() -> dict[str, dict[str, object]]:
+def load_state() -> dict[str, Any]:
+    default: dict[str, Any] = {"files": {}, "dirs": [], "git": {}}
     if not STATE_FILE.exists():
-        return {}
+        return default
     try:
         data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
-        return data.get("files", {}) if isinstance(data, dict) else {}
-    except Exception:
-        return {}
+        if not isinstance(data, dict):
+            log("Warning: state.json root is not a dict; resetting baseline", err=True)
+            return default
+        return {
+            "files": data.get("files", {}) if isinstance(data.get("files"), dict) else {},
+            "dirs": data.get("dirs", []) if isinstance(data.get("dirs"), list) else [],
+            "git": data.get("git", {}) if isinstance(data.get("git"), dict) else {},
+        }
+    except Exception as exc:
+        log(f"Warning: failed to parse state.json ({exc}); resetting baseline", err=True)
+        return default
 
 
-def save_state(files: dict[str, dict[str, object]]) -> None:
+def save_state(state: dict[str, Any]) -> None:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     tmp = STATE_FILE.with_suffix(".tmp")
-    tmp.write_text(json.dumps({"files": files}, indent=2, sort_keys=True), encoding="utf-8")
+    tmp.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
     tmp.replace(STATE_FILE)
 
 
-def log(msg: str) -> None:
-    ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{ts}] {msg}", flush=True)
+def is_git_busy(repo: Path) -> bool:
+    git_dir = repo / ".git"
+    if not git_dir.is_dir():
+        return False
+    return any((git_dir / marker).exists() for marker in GIT_BUSY_MARKERS)
 
 
-def sync() -> int:
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    with LOCK_FILE.open("w") as lock_fh:
+def git_run(repo: Path, *args: str, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["git", "-C", str(repo), *args],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+
+def git_out(repo: Path, *args: str) -> str | None:
+    res = git_run(repo, *args)
+    return res.stdout.strip() if res.returncode == 0 else None
+
+
+def git_has_staged_changes(repo: Path) -> bool:
+    res = git_run(repo, "diff", "--cached", "--quiet")
+    return res.returncode != 0
+
+
+def git_remote_refs(repo: Path) -> dict[str, str]:
+    out = git_out(
+        repo,
+        "for-each-ref",
+        "--format=%(refname) %(objectname) %(symref)",
+        "refs/remotes/origin",
+    )
+    refs: dict[str, str] = {}
+    if not out:
+        return refs
+    for line in out.splitlines():
+        parts = line.split(" ")
+        if len(parts) < 2:
+            continue
+        refname, oid = parts[0], parts[1]
+        symref = parts[2] if len(parts) >= 3 else ""
+        if symref:
+            continue
+        refs[refname] = oid
+    return refs
+
+
+def git_is_ancestor(repo: Path, ancestor: str, descendant: str) -> bool:
+    return git_run(repo, "merge-base", "--is-ancestor", ancestor, descendant).returncode == 0
+
+
+def apply_git_head(
+    src: Path,
+    dst: Path,
+    src_branch: str,
+    dst_branch: str,
+    label: str,
+    actions: list[str],
+) -> bool:
+    if git_has_staged_changes(dst):
+        log(f"GIT skip {label}: destination {dst} has staged changes", err=True)
+        return False
+
+    env = os.environ.copy()
+    env["FOLDER_MIRROR_GIT_SYNC"] = "1"
+    r1 = git_run(dst, "fetch", "--quiet", "--no-tags", str(src), "HEAD", env=env)
+    if r1.returncode != 0:
+        log(f"GIT error {label} fetch HEAD: {r1.stderr.strip()}", err=True)
+        return False
+
+    if src_branch != dst_branch:
+        r2 = git_run(dst, "update-ref", f"refs/heads/{src_branch}", "FETCH_HEAD", env=env)
+        if r2.returncode != 0:
+            log(f"GIT error {label} update-ref {src_branch}: {r2.stderr.strip()}", err=True)
+            return False
+        r3 = git_run(dst, "symbolic-ref", "HEAD", f"refs/heads/{src_branch}", env=env)
+        if r3.returncode != 0:
+            log(f"GIT error {label} symbolic-ref {src_branch}: {r3.stderr.strip()}", err=True)
+            return False
+        r4 = git_run(dst, "reset", "--quiet", "--mixed", "HEAD", env=env)
+        if r4.returncode != 0:
+            log(f"GIT error {label} reset --mixed HEAD: {r4.stderr.strip()}", err=True)
+            return False
+    else:
+        r2 = git_run(dst, "reset", "--quiet", "--mixed", "FETCH_HEAD", env=env)
+        if r2.returncode != 0:
+            log(f"GIT error {label} reset --mixed FETCH_HEAD: {r2.stderr.strip()}", err=True)
+            return False
+
+    new_head = git_out(dst, "rev-parse", "--short", "HEAD") or ""
+    actions.append(f"GIT {label} {src_branch}@{new_head}")
+    return True
+
+
+def sync_git_state(
+    prev_git: dict[str, Any],
+    source: str | None,
+    actions: list[str],
+) -> dict[str, Any]:
+    """Keep both local git repos aligned using 3-way ref state (never unsafe timestamp resets)."""
+    if not (DIR_A / ".git").exists() or not (DIR_B / ".git").exists():
+        return prev_git
+
+    branch_a = git_out(DIR_A, "symbolic-ref", "--quiet", "--short", "HEAD")
+    branch_b = git_out(DIR_B, "symbolic-ref", "--quiet", "--short", "HEAD")
+    head_a = git_out(DIR_A, "rev-parse", "HEAD")
+    head_b = git_out(DIR_B, "rev-parse", "HEAD")
+
+    new_git: dict[str, Any] = dict(prev_git)
+    prev_branch = prev_git.get("branch")
+    prev_head = prev_git.get("head")
+
+    if branch_a and branch_b and head_a and head_b:
+        a_state = (branch_a, head_a)
+        b_state = (branch_b, head_b)
+        p_state = (prev_branch, prev_head)
+
+        if a_state == b_state:
+            new_git["branch"] = branch_a
+            new_git["head"] = head_a
+        else:
+            direction: str | None = None
+            if source == "A" and b_state == p_state:
+                direction = "A->B"
+            elif source == "B" and a_state == p_state:
+                direction = "B->A"
+            elif a_state != p_state and b_state == p_state:
+                direction = "A->B"
+            elif b_state != p_state and a_state == p_state:
+                direction = "B->A"
+            elif branch_a == branch_b:
+                # Both changed (or no baseline yet): only fast-forward if strictly linear.
+                env = os.environ.copy()
+                env["FOLDER_MIRROR_GIT_SYNC"] = "1"
+                git_run(DIR_A, "fetch", "--quiet", "--no-tags", str(DIR_B), "HEAD", env=env)
+                if git_is_ancestor(DIR_A, head_a, head_b):
+                    direction = "B->A"
+                elif git_is_ancestor(DIR_A, head_b, head_a):
+                    direction = "A->B"
+
+            if direction == "A->B":
+                if apply_git_head(DIR_A, DIR_B, branch_a, branch_b, "A->B", actions):
+                    new_git["branch"] = branch_a
+                    new_git["head"] = head_a
+            elif direction == "B->A":
+                if apply_git_head(DIR_B, DIR_A, branch_b, branch_a, "B->A", actions):
+                    new_git["branch"] = branch_b
+                    new_git["head"] = head_b
+            else:
+                log(
+                    f"GIT conflict: A={branch_a}@{head_a[:7]} vs B={branch_b}@{head_b[:7]} diverged; skipping",
+                    err=True,
+                )
+    elif head_a and head_b and head_a != head_b:
+        log("GIT skip: detached HEAD detected in one or both repos", err=True)
+
+    # Sync all refs/remotes/origin/* dynamically using 3-way state + local fetch.
+    prev_remotes = prev_git.get("remotes", {}) if isinstance(prev_git.get("remotes"), dict) else {}
+    rem_a = git_remote_refs(DIR_A)
+    rem_b = git_remote_refs(DIR_B)
+    new_remotes: dict[str, str] = {}
+    env = os.environ.copy()
+    env["FOLDER_MIRROR_GIT_SYNC"] = "1"
+
+    for ref in sorted(set(rem_a) | set(rem_b) | set(prev_remotes)):
+        oid_a = rem_a.get(ref)
+        oid_b = rem_b.get(ref)
+        oid_p = prev_remotes.get(ref)
+
+        if oid_a == oid_b:
+            if oid_a is not None:
+                new_remotes[ref] = oid_a
+            continue
+
+        if oid_a and oid_b:
+            a_chg = oid_a != oid_p
+            b_chg = oid_b != oid_p
+            if a_chg and not b_chg:
+                r = git_run(DIR_B, "fetch", "--quiet", "--no-tags", str(DIR_A), f"+{ref}:{ref}", env=env)
+                if r.returncode == 0:
+                    new_remotes[ref] = oid_a
+                    actions.append(f"GIT A->B {ref}->{oid_a[:7]}")
+                else:
+                    log(f"GIT error A->B {ref}: {r.stderr.strip()}", err=True)
+                    if oid_p:
+                        new_remotes[ref] = oid_p
+            elif b_chg and not a_chg:
+                r = git_run(DIR_A, "fetch", "--quiet", "--no-tags", str(DIR_B), f"+{ref}:{ref}", env=env)
+                if r.returncode == 0:
+                    new_remotes[ref] = oid_b
+                    actions.append(f"GIT B->A {ref}->{oid_b[:7]}")
+                else:
+                    log(f"GIT error B->A {ref}: {r.stderr.strip()}", err=True)
+                    if oid_p:
+                        new_remotes[ref] = oid_p
+            else:
+                # Both changed or no baseline: fast-forward if linear.
+                git_run(DIR_A, "fetch", "--quiet", "--no-tags", str(DIR_B), ref, env=env)
+                if git_is_ancestor(DIR_A, oid_a, oid_b):
+                    r = git_run(DIR_A, "fetch", "--quiet", "--no-tags", str(DIR_B), f"+{ref}:{ref}", env=env)
+                    if r.returncode == 0:
+                        new_remotes[ref] = oid_b
+                        actions.append(f"GIT B->A {ref}->{oid_b[:7]}")
+                    elif oid_p:
+                        new_remotes[ref] = oid_p
+                elif git_is_ancestor(DIR_A, oid_b, oid_a):
+                    r = git_run(DIR_B, "fetch", "--quiet", "--no-tags", str(DIR_A), f"+{ref}:{ref}", env=env)
+                    if r.returncode == 0:
+                        new_remotes[ref] = oid_a
+                        actions.append(f"GIT A->B {ref}->{oid_a[:7]}")
+                    elif oid_p:
+                        new_remotes[ref] = oid_p
+                elif oid_p:
+                    new_remotes[ref] = oid_p
+        elif oid_a and not oid_b:
+            if oid_p is not None and oid_a == oid_p:
+                r = git_run(DIR_A, "update-ref", "-d", ref, env=env)
+                if r.returncode == 0:
+                    actions.append(f"GIT DEL A {ref}")
+                else:
+                    new_remotes[ref] = oid_p
+            else:
+                r = git_run(DIR_B, "fetch", "--quiet", "--no-tags", str(DIR_A), f"+{ref}:{ref}", env=env)
+                if r.returncode == 0:
+                    new_remotes[ref] = oid_a
+                    actions.append(f"GIT A->B {ref}->{oid_a[:7]}")
+                else:
+                    log(f"GIT error A->B {ref}: {r.stderr.strip()}", err=True)
+        elif oid_b and not oid_a:
+            if oid_p is not None and oid_b == oid_p:
+                r = git_run(DIR_B, "update-ref", "-d", ref, env=env)
+                if r.returncode == 0:
+                    actions.append(f"GIT DEL B {ref}")
+                else:
+                    new_remotes[ref] = oid_p
+            else:
+                r = git_run(DIR_A, "fetch", "--quiet", "--no-tags", str(DIR_B), f"+{ref}:{ref}", env=env)
+                if r.returncode == 0:
+                    new_remotes[ref] = oid_b
+                    actions.append(f"GIT B->A {ref}->{oid_b[:7]}")
+                else:
+                    log(f"GIT error B->A {ref}: {r.stderr.strip()}", err=True)
+
+    new_git["remotes"] = new_remotes
+    return new_git
+
+
+def acquire_lock(lock_fh: Any, wait_seconds: float) -> bool:
+    deadline = time.monotonic() + max(0.0, wait_seconds)
+    while True:
         try:
             fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
         except BlockingIOError:
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.05)
+
+
+def sync(*, wait_seconds: float = 0.0, source: str | None = None) -> int:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    with LOCK_FILE.open("w") as lock_fh:
+        if not acquire_lock(lock_fh, wait_seconds):
+            if wait_seconds > 0:
+                log(f"Skipping sync: lock busy after {wait_seconds:.1f}s", err=True)
             return 0
 
         if not DIR_A.exists() or not DIR_B.exists():
-            log(f"Skipping sync: missing directory ({DIR_A.exists()=}, {DIR_B.exists()=})")
+            log(f"Skipping sync: missing directory ({DIR_A.exists()=}, {DIR_B.exists()=})", err=True)
             return 1
 
-        prev = load_state()
-        snap_a = scan_dir(DIR_A)
-        snap_b = scan_dir(DIR_B)
+        # Defer the ENTIRE sync if either repo is mid-git-operation (commit/merge/rebase/checkout).
+        if is_git_busy(DIR_A) or is_git_busy(DIR_B):
+            return 0
 
-        all_paths = sorted(set(snap_a) | set(snap_b) | set(prev))
+        prev_state = load_state()
+        prev_files: dict[str, dict[str, Any]] = prev_state["files"]
+        prev_dirs: set[str] = set(prev_state["dirs"])
+        prev_git: dict[str, Any] = prev_state["git"]
+
+        snap_a, dirs_a = scan_dir(DIR_A, "a", prev_files)
+        snap_b, dirs_b = scan_dir(DIR_B, "b", prev_files)
+
+        all_paths = sorted(set(snap_a) | set(snap_b) | set(prev_files))
         actions: list[str] = []
+        new_files: dict[str, dict[str, Any]] = {}
+
+        # Plan operations so deletions run before copies (prevents file<->dir collisions).
+        deletes: list[tuple[str, Path, str]] = []
+        copies: list[tuple[str, Path, Path, str, str, dict[str, Any]]] = []
 
         for rel in all_paths:
             in_a = snap_a.get(rel)
             in_b = snap_b.get(rel)
-            in_p = prev.get(rel)
+            in_p = prev_files.get(rel)
 
             if in_a and in_b:
                 if in_a["hash"] == in_b["hash"]:
+                    new_files[rel] = {
+                        "type": in_a["type"],
+                        "hash": in_a["hash"],
+                        "a": in_a["meta"],
+                        "b": in_b["meta"],
+                    }
                     continue
+
                 a_changed = (in_p is None) or (in_a["hash"] != in_p.get("hash"))
                 b_changed = (in_p is None) or (in_b["hash"] != in_p.get("hash"))
                 if a_changed and not b_changed:
-                    copy_entry(DIR_A, DIR_B, rel)
-                    actions.append(f"A->B {rel}")
+                    copies.append(("A->B", DIR_A, DIR_B, rel, f"A->B {rel}", in_a))
                 elif b_changed and not a_changed:
-                    copy_entry(DIR_B, DIR_A, rel)
-                    actions.append(f"B->A {rel}")
+                    copies.append(("B->A", DIR_B, DIR_A, rel, f"B->A {rel}", in_b))
                 else:
-                    # Both changed: newer mtime wins
-                    if float(in_a["mtime"]) >= float(in_b["mtime"]):
-                        copy_entry(DIR_A, DIR_B, rel)
-                        actions.append(f"A->B (conflict, newer) {rel}")
+                    if int(in_a["mtime_ns"]) >= int(in_b["mtime_ns"]):
+                        copies.append(("A->B", DIR_A, DIR_B, rel, f"A->B (conflict, newer) {rel}", in_a))
                     else:
-                        copy_entry(DIR_B, DIR_A, rel)
-                        actions.append(f"B->A (conflict, newer) {rel}")
+                        copies.append(("B->A", DIR_B, DIR_A, rel, f"B->A (conflict, newer) {rel}", in_b))
             elif in_a and not in_b:
                 if in_p is not None and in_a["hash"] == in_p.get("hash"):
-                    remove_entry(DIR_A, rel)
-                    actions.append(f"DEL A {rel}")
+                    deletes.append(("DEL A", DIR_A, rel))
                 else:
-                    copy_entry(DIR_A, DIR_B, rel)
-                    actions.append(f"A->B {rel}")
+                    copies.append(("A->B", DIR_A, DIR_B, rel, f"A->B {rel}", in_a))
             elif in_b and not in_a:
                 if in_p is not None and in_b["hash"] == in_p.get("hash"):
-                    remove_entry(DIR_B, rel)
-                    actions.append(f"DEL B {rel}")
+                    deletes.append(("DEL B", DIR_B, rel))
                 else:
-                    copy_entry(DIR_B, DIR_A, rel)
-                    actions.append(f"B->A {rel}")
+                    copies.append(("B->A", DIR_B, DIR_A, rel, f"B->A {rel}", in_b))
 
-        # Re-scan after sync to record exact post-sync state
-        final_state = scan_dir(DIR_A)
-        save_state(final_state)
+        # Phase 1: Execute file deletions first.
+        for label, root, rel in deletes:
+            try:
+                remove_entry(root, rel)
+                actions.append(f"{label} {rel}")
+            except OSError as exc:
+                log(f"Error {label} {rel}: {exc}", err=True)
+                if rel in prev_files:
+                    new_files[rel] = prev_files[rel]
+
+        # Phase 1b: Remove deleted directories deepest-first before copies so nested
+        # directory->file replacements succeed on the same pass.
+        planned_file_parents: set[str] = set()
+        for rel in set(new_files) | {c[3] for c in copies}:
+            p = Path(rel).parent
+            while str(p) != ".":
+                planned_file_parents.add(p.as_posix())
+                p = p.parent
+
+        all_dirs = set(dirs_a) | set(dirs_b) | prev_dirs
+        kept_nonempty_dirs: set[str] = set()
+        for d in sorted(all_dirs, key=lambda x: (x.count("/"), x), reverse=True):
+            if d in planned_file_parents:
+                continue
+            in_a = d in dirs_a
+            in_b = d in dirs_b
+            in_p = d in prev_dirs
+            if in_a and not in_b and in_p:
+                target = DIR_A / d
+                try:
+                    if target.is_dir() and not target.is_symlink():
+                        target.rmdir()
+                        actions.append(f"RMDIR A {d}")
+                except OSError:
+                    kept_nonempty_dirs.add(d)
+            elif in_b and not in_a and in_p:
+                target = DIR_B / d
+                try:
+                    if target.is_dir() and not target.is_symlink():
+                        target.rmdir()
+                        actions.append(f"RMDIR B {d}")
+                except OSError:
+                    kept_nonempty_dirs.add(d)
+
+        # Phase 2: Execute atomic file/symlink copies and record deterministic state.
+        for direction, src_root, dst_root, rel, action_label, src_snap in copies:
+            try:
+                entry_type, copied_hash, dst_meta = copy_entry(src_root, dst_root, rel)
+                actions.append(action_label)
+                entry: dict[str, Any] = {
+                    "type": entry_type,
+                    "hash": copied_hash,
+                }
+                if direction == "A->B":
+                    if copied_hash == src_snap["hash"]:
+                        entry["a"] = src_snap["meta"]
+                    entry["b"] = dst_meta
+                else:
+                    entry["a"] = dst_meta
+                    if copied_hash == src_snap["hash"]:
+                        entry["b"] = src_snap["meta"]
+                new_files[rel] = entry
+            except OSError as exc:
+                log(f"Error {action_label}: {exc}", err=True)
+                if rel in prev_files:
+                    new_files[rel] = prev_files[rel]
+
+        # Phase 3: Create missing directories (including empty directories) shallowest-first.
+        file_parents: set[str] = set()
+        for rel in new_files:
+            p = Path(rel).parent
+            while str(p) != ".":
+                file_parents.add(p.as_posix())
+                p = p.parent
+
+        new_dirs: set[str] = set(file_parents) | kept_nonempty_dirs
+        for d in sorted(all_dirs, key=lambda x: (x.count("/"), x)):
+            in_a = d in dirs_a
+            in_b = d in dirs_b
+            in_p = d in prev_dirs
+            if in_a and in_b:
+                new_dirs.add(d)
+            elif in_a and not in_b and not in_p:
+                try:
+                    (DIR_B / d).mkdir(parents=True, exist_ok=True)
+                    new_dirs.add(d)
+                    actions.append(f"MKDIR B {d}")
+                except OSError as exc:
+                    log(f"Error MKDIR B {d}: {exc}", err=True)
+            elif in_b and not in_a and not in_p:
+                try:
+                    (DIR_A / d).mkdir(parents=True, exist_ok=True)
+                    new_dirs.add(d)
+                    actions.append(f"MKDIR A {d}")
+                except OSError as exc:
+                    log(f"Error MKDIR A {d}: {exc}", err=True)
+
+        new_git = sync_git_state(prev_git, source, actions)
+
+        new_state = {
+            "files": new_files,
+            "dirs": sorted(new_dirs),
+            "git": new_git,
+        }
+        if new_state != prev_state:
+            save_state(new_state)
 
         if actions:
             for act in actions:
                 log(act)
 
+        trim_log_file(LOG_FILE)
+        trim_log_file(ERR_LOG_FILE)
+
     return 0
 
 
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Keep two local folders on macOS mirrored in real time.")
+    parser.add_argument(
+        "--wait",
+        type=float,
+        default=0.0,
+        help="Seconds to wait for sync lock before skipping (default: 0, non-blocking).",
+    )
+    parser.add_argument(
+        "--source",
+        choices=("A", "B"),
+        default=None,
+        help="Hint indicating which side triggered the sync (used by git hooks).",
+    )
+    return parser.parse_args(argv)
+
+
 if __name__ == "__main__":
-    sys.exit(sync())
+    args = parse_args(sys.argv[1:])
+    sys.exit(sync(wait_seconds=args.wait, source=args.source))
