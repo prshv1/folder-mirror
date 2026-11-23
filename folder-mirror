@@ -11,6 +11,7 @@ import json
 import os
 import secrets
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -25,9 +26,14 @@ STATE_FILE = STATE_DIR / "state.json"
 LOCK_FILE = STATE_DIR / "sync.lock"
 LOG_FILE = STATE_DIR / "sync.log"
 ERR_LOG_FILE = STATE_DIR / "sync.err.log"
+LAUNCHD_LOG_FILE = STATE_DIR / "launchd.log"
+LAUNCHD_ERR_LOG_FILE = STATE_DIR / "launchd.err.log"
+CONFLICTS_DIR = STATE_DIR / "conflicts"
 
 MAX_LOG_BYTES = 256 * 1024
-TRIM_LOG_BYTES = 128 * 1024
+STALE_TMP_AGE_SECONDS = 300.0
+MAX_CONFLICT_BACKUPS = 50
+GIT_TIMEOUT_SECONDS = 30
 
 # Only exclude .git internals from raw file copying; git refs are synced safely via git commands.
 EXCLUDED_NAMES = {".git"}
@@ -38,6 +44,7 @@ TEMP_SUFFIX = ".tmp"
 GIT_BUSY_MARKERS = (
     "index.lock",
     "HEAD.lock",
+    "packed-refs.lock",
     "MERGE_HEAD",
     "REBASE_HEAD",
     "CHERRY_PICK_HEAD",
@@ -45,6 +52,19 @@ GIT_BUSY_MARKERS = (
     "BISECT_LOG",
     "rebase-merge",
     "rebase-apply",
+)
+
+# Git hook environment variables that override `git -C <repo>` and must be stripped.
+GIT_ENV_STRIP = (
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_COMMON_DIR",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_QUARANTINE_PATH",
+    "GIT_PREFIX",
+    "GIT_SUPER_PREFIX",
 )
 
 
@@ -58,43 +78,66 @@ def is_excluded(rel_parts: tuple[str, ...]) -> bool:
 
 def log(msg: str, *, err: bool = False) -> None:
     ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    stream = sys.stderr if err else sys.stdout
-    print(f"[{ts}] {msg}", file=stream, flush=True)
-
-
-def trim_log_file(path: Path) -> None:
+    line = f"[{ts}] {msg}\n"
+    target = ERR_LOG_FILE if err else LOG_FILE
     try:
-        if not path.exists():
-            return
-        size = path.stat().st_size
-        if size <= MAX_LOG_BYTES:
-            return
-        with path.open("r+b") as fh:
-            fh.seek(max(0, size - TRIM_LOG_BYTES))
-            tail = fh.read()
-            nl = tail.find(b"\n")
-            if nl != -1 and nl + 1 < len(tail):
-                tail = tail[nl + 1 :]
-            fh.seek(0)
-            fh.write(tail)
-            fh.truncate()
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        with target.open("a", encoding="utf-8") as fh:
+            fh.write(line)
+    except OSError:
+        pass
+    if os.environ.get("FOLDER_MIRROR_STDIO") == "1" or (sys.stderr.isatty() if err else sys.stdout.isatty()):
+        stream = sys.stderr if err else sys.stdout
+        print(line, end="", file=stream, flush=True)
+
+
+def rotate_log_file(path: Path) -> None:
+    """Atomically rotate log file to <name>.1 when over MAX_LOG_BYTES (no in-place truncation)."""
+    try:
+        if path.exists() and path.stat().st_size > MAX_LOG_BYTES:
+            rotated = path.with_name(path.name + ".1")
+            path.replace(rotated)
     except OSError:
         pass
 
 
 def stat_meta(st: os.stat_result, entry_type: str) -> dict[str, int]:
     if entry_type == "symlink":
-        return {"mtime_ns": st.st_mtime_ns}
-    return {"mtime_ns": st.st_mtime_ns, "size": st.st_size}
+        return {
+            "mtime_ns": st.st_mtime_ns,
+            "ctime_ns": st.st_ctime_ns,
+            "ino": st.st_ino,
+        }
+    return {
+        "mtime_ns": st.st_mtime_ns,
+        "ctime_ns": st.st_ctime_ns,
+        "size": st.st_size,
+        "ino": st.st_ino,
+        "mode": st.st_mode & 0o777,
+    }
+
+
+def entry_sig(entry: dict[str, Any]) -> tuple[Any, ...]:
+    return (entry.get("type"), entry.get("hash"), entry.get("mode"))
+
+
+def matches_prev(cur: dict[str, Any], prev: dict[str, Any] | None) -> bool:
+    if prev is None:
+        return False
+    if cur.get("type") != prev.get("type") or cur.get("hash") != prev.get("hash"):
+        return False
+    if prev.get("mode") is not None and cur.get("mode") != prev.get("mode"):
+        return False
+    return True
 
 
 def file_signature(
     path: Path,
     side: str,
     cached: dict[str, Any] | None,
-) -> dict[str, Any]:
+) -> dict[str, Any] | None:
     st = path.lstat()
-    if path.is_symlink():
+    if stat.S_ISLNK(st.st_mode):
         target = os.readlink(path)
         digest = hashlib.sha256(f"symlink:{target}".encode("utf-8")).hexdigest()
         return {
@@ -102,8 +145,13 @@ def file_signature(
             "target": target,
             "hash": digest,
             "mtime_ns": st.st_mtime_ns,
+            "ctime_ns": st.st_ctime_ns,
             "meta": stat_meta(st, "symlink"),
         }
+
+    if not stat.S_ISREG(st.st_mode):
+        log(f"Skipping special non-regular file: {path}", err=True)
+        return None
 
     meta = stat_meta(st, "file")
     if (
@@ -123,9 +171,21 @@ def file_signature(
     return {
         "type": "file",
         "hash": digest,
+        "mode": meta["mode"],
         "mtime_ns": st.st_mtime_ns,
+        "ctime_ns": st.st_ctime_ns,
         "meta": meta,
     }
+
+
+def cleanup_stale_temp(path: Path) -> None:
+    try:
+        st = path.lstat()
+        if time.time() - st.st_mtime > STALE_TMP_AGE_SECONDS:
+            path.unlink(missing_ok=True)
+            log(f"Cleaned stale temp file: {path}")
+    except OSError:
+        pass
 
 
 def scan_dir(
@@ -146,37 +206,88 @@ def scan_dir(
         kept_dirs: list[str] = []
         for d in dirnames:
             rel_path = rel_dir / d if str(rel_dir) != "." else Path(d)
+            full_path = root / rel_path
+            if is_temp_name(d):
+                cleanup_stale_temp(full_path)
+                continue
             if is_excluded(rel_path.parts):
                 continue
-            full_path = root / rel_path
-            if full_path.is_symlink():
-                rel_str = rel_path.as_posix()
-                try:
-                    entries[rel_str] = file_signature(full_path, side, prev_files.get(rel_str))
-                except FileNotFoundError:
-                    continue
-            else:
-                kept_dirs.append(d)
+            try:
+                if full_path.is_symlink():
+                    rel_str = rel_path.as_posix()
+                    sig = file_signature(full_path, side, prev_files.get(rel_str))
+                    if sig is not None:
+                        entries[rel_str] = sig
+                else:
+                    kept_dirs.append(d)
+            except OSError as exc:
+                log(f"Skipping unreadable directory entry {full_path}: {exc}", err=True)
         dirnames[:] = kept_dirs
 
         for name in filenames:
             rel_path = rel_dir / name if str(rel_dir) != "." else Path(name)
+            full_path = root / rel_path
+            if is_temp_name(name):
+                cleanup_stale_temp(full_path)
+                continue
             if is_excluded(rel_path.parts):
                 continue
-            full_path = root / rel_path
             rel_str = rel_path.as_posix()
             try:
-                entries[rel_str] = file_signature(full_path, side, prev_files.get(rel_str))
+                sig = file_signature(full_path, side, prev_files.get(rel_str))
+                if sig is not None:
+                    entries[rel_str] = sig
             except FileNotFoundError:
                 continue
+            except OSError as exc:
+                log(f"Skipping unreadable file {full_path}: {exc}", err=True)
 
     return entries, dirs
 
 
-def copy_entry(src_root: Path, dst_root: Path, rel: str) -> tuple[str, str, dict[str, int]]:
+def prune_conflict_backups() -> None:
+    if not CONFLICTS_DIR.is_dir():
+        return
+    batches = sorted(p for p in CONFLICTS_DIR.iterdir() if p.is_dir())
+    for old in batches[:-MAX_CONFLICT_BACKUPS]:
+        shutil.rmtree(old, ignore_errors=True)
+
+
+def backup_conflict(dst_root: Path, rel: str, losing_side: str) -> None:
+    """Save a backup of the losing side (regular file or symlink target) on a conflict."""
+    name = Path(rel).name
+    if name == ".DS_Store" or name.startswith("._"):
+        return
+    dst = dst_root / rel
+    try:
+        ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+        if dst.is_symlink():
+            target = os.readlink(dst)
+            backup_path = CONFLICTS_DIR / f"{ts}_{losing_side}" / f"{rel}.symlink.txt"
+            backup_path.parent.mkdir(parents=True, exist_ok=True)
+            backup_path.write_text(f"{target}\n", encoding="utf-8")
+            log(f"CONFLICT symlink backup saved ({rel} -> {target}): {backup_path}")
+            prune_conflict_backups()
+            return
+        if not dst.is_file():
+            return
+        backup_path = CONFLICTS_DIR / f"{ts}_{losing_side}" / rel
+        backup_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(dst, backup_path)
+        log(f"CONFLICT backup saved: {backup_path}")
+        prune_conflict_backups()
+    except OSError as exc:
+        log(f"Warning: failed to back up conflict for {rel}: {exc}", err=True)
+
+
+def copy_entry(
+    src_root: Path,
+    dst_root: Path,
+    rel: str,
+) -> tuple[str, str, int | None, dict[str, int]]:
     """Atomically copy a file or symlink from src_root/rel to dst_root/rel.
 
-    Returns (entry_type, content_hash, dst_stat_meta).
+    Returns (entry_type, content_hash, mode_or_none, dst_stat_meta).
     Raises OSError if destination is a non-empty directory or copy fails.
     """
     src = src_root / rel
@@ -200,7 +311,7 @@ def copy_entry(src_root: Path, dst_root: Path, rel: str) -> tuple[str, str, dict
             if tmp_path.is_symlink() or tmp_path.exists():
                 tmp_path.unlink(missing_ok=True)
             raise
-        return "symlink", digest, stat_meta(dst.lstat(), "symlink")
+        return "symlink", digest, None, stat_meta(dst.lstat(), "symlink")
 
     h = hashlib.sha256()
     fd, tmp_name = tempfile.mkstemp(
@@ -220,7 +331,9 @@ def copy_entry(src_root: Path, dst_root: Path, rel: str) -> tuple[str, str, dict
         tmp_path.unlink(missing_ok=True)
         raise
 
-    return "file", h.hexdigest(), stat_meta(dst.lstat(), "file")
+    dst_st = dst.lstat()
+    dst_meta = stat_meta(dst_st, "file")
+    return "file", h.hexdigest(), dst_meta["mode"], dst_meta
 
 
 def remove_entry(root: Path, rel: str) -> None:
@@ -255,7 +368,11 @@ def load_state() -> dict[str, Any]:
 def save_state(state: dict[str, Any]) -> None:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     tmp = STATE_FILE.with_suffix(".tmp")
-    tmp.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
+    payload = json.dumps(state, indent=2, sort_keys=True)
+    with tmp.open("w", encoding="utf-8") as fh:
+        fh.write(payload)
+        fh.flush()
+        os.fsync(fh.fileno())
     tmp.replace(STATE_FILE)
 
 
@@ -263,16 +380,81 @@ def is_git_busy(repo: Path) -> bool:
     git_dir = repo / ".git"
     if not git_dir.is_dir():
         return False
-    return any((git_dir / marker).exists() for marker in GIT_BUSY_MARKERS)
+    if any((git_dir / marker).exists() for marker in GIT_BUSY_MARKERS):
+        return True
+    refs_dir = git_dir / "refs"
+    if refs_dir.is_dir():
+        try:
+            if any(refs_dir.rglob("*.lock")):
+                return True
+        except OSError:
+            return True
+    return False
 
 
-def git_run(repo: Path, *args: str, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        ["git", "-C", str(repo), *args],
-        capture_output=True,
-        text=True,
-        env=env,
-    )
+def git_meta_fingerprint(repo: Path) -> str | None:
+    """Fast pure-Python fingerprint of .git metadata so idle runs spawn 0 git subprocesses."""
+    git_dir = repo / ".git"
+    if not git_dir.is_dir():
+        return None
+    parts: list[str] = []
+    for rel in ("HEAD", "packed-refs", "config", "index"):
+        p = git_dir / rel
+        try:
+            st = p.lstat()
+            parts.append(f"{rel}:{st.st_mtime_ns}:{st.st_ctime_ns}:{st.st_size}:{st.st_ino}")
+        except FileNotFoundError:
+            parts.append(f"{rel}:missing")
+        except OSError:
+            return None
+    refs_dir = git_dir / "refs"
+    if refs_dir.is_dir():
+        ref_entries: list[str] = []
+        try:
+            for dirpath, dirnames, filenames in os.walk(refs_dir, followlinks=False):
+                dirnames.sort()
+                filenames.sort()
+                rel_dir = Path(dirpath).relative_to(git_dir)
+                for fn in filenames:
+                    fp = Path(dirpath) / fn
+                    st = fp.lstat()
+                    ref_entries.append(
+                        f"{(rel_dir / fn).as_posix()}:{st.st_mtime_ns}:{st.st_ctime_ns}:{st.st_size}:{st.st_ino}"
+                    )
+        except OSError:
+            return None
+        parts.extend(ref_entries)
+    return hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()
+
+
+def sanitized_git_env(*, set_sync_guard: bool = False) -> dict[str, str]:
+    env = {k: v for k, v in os.environ.items() if k not in GIT_ENV_STRIP}
+    if set_sync_guard:
+        env["FOLDER_MIRROR_GIT_SYNC"] = "1"
+    return env
+
+
+def git_run(
+    repo: Path,
+    *args: str,
+    sync_guard: bool = False,
+) -> subprocess.CompletedProcess[str]:
+    try:
+        return subprocess.run(
+            ["git", "-C", str(repo), *args],
+            capture_output=True,
+            text=True,
+            env=sanitized_git_env(set_sync_guard=sync_guard),
+            timeout=GIT_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        log(f"GIT timeout ({GIT_TIMEOUT_SECONDS}s) in {repo}: git {' '.join(args)}", err=True)
+        return subprocess.CompletedProcess(
+            args=["git", "-C", str(repo), *args],
+            returncode=124,
+            stdout="",
+            stderr="timeout",
+        )
 
 
 def git_out(repo: Path, *args: str) -> str | None:
@@ -285,16 +467,21 @@ def git_has_staged_changes(repo: Path) -> bool:
     return res.returncode != 0
 
 
-def git_remote_refs(repo: Path) -> dict[str, str]:
+def git_all_refs(repo: Path) -> tuple[dict[str, str], dict[str, str], dict[str, str]]:
+    """Read refs/heads, refs/remotes/origin, and refs/tags in a single git invocation."""
     out = git_out(
         repo,
         "for-each-ref",
         "--format=%(refname) %(objectname) %(symref)",
+        "refs/heads",
         "refs/remotes/origin",
+        "refs/tags",
     )
-    refs: dict[str, str] = {}
+    heads: dict[str, str] = {}
+    remotes: dict[str, str] = {}
+    tags: dict[str, str] = {}
     if not out:
-        return refs
+        return heads, remotes, tags
     for line in out.splitlines():
         parts = line.split(" ")
         if len(parts) < 2:
@@ -303,12 +490,139 @@ def git_remote_refs(repo: Path) -> dict[str, str]:
         symref = parts[2] if len(parts) >= 3 else ""
         if symref:
             continue
-        refs[refname] = oid
-    return refs
+        if refname.startswith("refs/heads/"):
+            heads[refname] = oid
+        elif refname.startswith("refs/remotes/origin/"):
+            remotes[refname] = oid
+        elif refname.startswith("refs/tags/"):
+            tags[refname] = oid
+    return heads, remotes, tags
+
+
+def git_all_branch_tracking(repo: Path) -> dict[str, dict[str, str]]:
+    """Read branch.*.remote and branch.*.merge in a single git config invocation."""
+    out = git_out(repo, "config", "--get-regexp", r"^branch\..*\.(remote|merge)$")
+    raw: dict[str, dict[str, str]] = {}
+    if not out:
+        return {}
+    for line in out.splitlines():
+        key, _, val = line.partition(" ")
+        if not val or not key.startswith("branch."):
+            continue
+        if key.endswith(".remote"):
+            branch = key[len("branch.") : -len(".remote")]
+            raw.setdefault(branch, {})["remote"] = val
+        elif key.endswith(".merge"):
+            branch = key[len("branch.") : -len(".merge")]
+            raw.setdefault(branch, {})["merge"] = val
+    return {
+        b: {"remote": d["remote"], "merge": d["merge"]}
+        for b, d in raw.items()
+        if "remote" in d and "merge" in d
+    }
+
+
+def set_branch_tracking(repo: Path, branch: str, tracking: dict[str, str] | None) -> bool:
+    if tracking is None:
+        git_run(repo, "config", "--unset", f"branch.{branch}.remote", sync_guard=True)
+        git_run(repo, "config", "--unset", f"branch.{branch}.merge", sync_guard=True)
+        return True
+    r1 = git_run(repo, "config", f"branch.{branch}.remote", tracking["remote"], sync_guard=True)
+    r2 = git_run(repo, "config", f"branch.{branch}.merge", tracking["merge"], sync_guard=True)
+    return r1.returncode == 0 and r2.returncode == 0
 
 
 def git_is_ancestor(repo: Path, ancestor: str, descendant: str) -> bool:
     return git_run(repo, "merge-base", "--is-ancestor", ancestor, descendant).returncode == 0
+
+
+def git_head_info(repo: Path) -> tuple[str | None, str | None]:
+    branch = git_out(repo, "symbolic-ref", "--quiet", "--short", "HEAD")
+    head = git_out(repo, "rev-parse", "HEAD")
+    return branch, head
+
+
+def decide_git_head_direction(
+    prev_git: dict[str, Any],
+    source: str | None,
+) -> tuple[str | None, str | None, str | None, str | None, str | None]:
+    """Return (direction, branch_a, head_a, branch_b, head_b).
+
+    direction is "A->B", "B->A", "EQUAL", "CONFLICT", or None (detached/missing).
+    """
+    branch_a, head_a = git_head_info(DIR_A)
+    branch_b, head_b = git_head_info(DIR_B)
+
+    if not (branch_a and branch_b and head_a and head_b):
+        return None, branch_a, head_a, branch_b, head_b
+
+    a_state = (branch_a, head_a)
+    b_state = (branch_b, head_b)
+    p_state = (prev_git.get("branch"), prev_git.get("head"))
+
+    if a_state == b_state:
+        return "EQUAL", branch_a, head_a, branch_b, head_b
+    if a_state != p_state and b_state == p_state:
+        return "A->B", branch_a, head_a, branch_b, head_b
+    if b_state != p_state and a_state == p_state:
+        return "B->A", branch_a, head_a, branch_b, head_b
+    if branch_a == branch_b:
+        git_run(DIR_A, "fetch", "--quiet", "--no-tags", str(DIR_B), "HEAD", sync_guard=True)
+        if git_is_ancestor(DIR_A, head_a, head_b):
+            return "B->A", branch_a, head_a, branch_b, head_b
+        if git_is_ancestor(DIR_A, head_b, head_a):
+            return "A->B", branch_a, head_a, branch_b, head_b
+    # If baseline is missing (e.g. first run or state reset) and a git hook explicitly
+    # fired on one side, honor the triggering hook's direction instead of deadlocking.
+    if p_state == (None, None) and source in ("A", "B"):
+        return ("A->B" if source == "A" else "B->A"), branch_a, head_a, branch_b, head_b
+    return "CONFLICT", branch_a, head_a, branch_b, head_b
+
+
+def check_git_preconditions(
+    prev_git: dict[str, Any],
+    source: str | None,
+) -> tuple[bool, bool, tuple[str | None, str | None, str | None, str | None, str | None] | None]:
+    """Check Git state before touching working-tree files.
+
+    Returns (should_defer, git_unchanged_fastpath, precomputed_decision).
+    """
+    if not (DIR_A / ".git").exists() or not (DIR_B / ".git").exists():
+        return False, True, None
+
+    meta_a = git_meta_fingerprint(DIR_A)
+    meta_b = git_meta_fingerprint(DIR_B)
+    if (
+        source is None
+        and meta_a is not None
+        and meta_b is not None
+        and prev_git.get("branch")
+        and prev_git.get("head")
+        and meta_a == prev_git.get("meta_a")
+        and meta_b == prev_git.get("meta_b")
+    ):
+        return False, True, None
+
+    decision = decide_git_head_direction(prev_git, source)
+    direction, branch_a, head_a, branch_b, head_b = decision
+
+    if direction == "CONFLICT" and branch_a and branch_b and head_a and head_b:
+        log(
+            f"GIT defer: A={branch_a}@{head_a[:7]} vs B={branch_b}@{head_b[:7]} diverged; skipping sync to avoid split-brain",
+            err=True,
+        )
+        return True, False, decision
+    if direction is None and head_a and head_b and head_a != head_b:
+        log("GIT defer: detached HEAD mismatch detected; skipping sync to avoid split-brain", err=True)
+        return True, False, decision
+    if direction == "A->B" and git_has_staged_changes(DIR_B):
+        log(f"GIT defer A->B: destination {DIR_B} has staged changes", err=True)
+        return True, False, decision
+    if direction == "B->A" and git_has_staged_changes(DIR_A):
+        log(f"GIT defer B->A: destination {DIR_A} has staged changes", err=True)
+        return True, False, decision
+
+    return False, False, decision
 
 
 def apply_git_head(
@@ -323,28 +637,26 @@ def apply_git_head(
         log(f"GIT skip {label}: destination {dst} has staged changes", err=True)
         return False
 
-    env = os.environ.copy()
-    env["FOLDER_MIRROR_GIT_SYNC"] = "1"
-    r1 = git_run(dst, "fetch", "--quiet", "--no-tags", str(src), "HEAD", env=env)
+    r1 = git_run(dst, "fetch", "--quiet", "--no-tags", str(src), "HEAD", sync_guard=True)
     if r1.returncode != 0:
         log(f"GIT error {label} fetch HEAD: {r1.stderr.strip()}", err=True)
         return False
 
     if src_branch != dst_branch:
-        r2 = git_run(dst, "update-ref", f"refs/heads/{src_branch}", "FETCH_HEAD", env=env)
+        r2 = git_run(dst, "update-ref", f"refs/heads/{src_branch}", "FETCH_HEAD", sync_guard=True)
         if r2.returncode != 0:
             log(f"GIT error {label} update-ref {src_branch}: {r2.stderr.strip()}", err=True)
             return False
-        r3 = git_run(dst, "symbolic-ref", "HEAD", f"refs/heads/{src_branch}", env=env)
+        r3 = git_run(dst, "symbolic-ref", "HEAD", f"refs/heads/{src_branch}", sync_guard=True)
         if r3.returncode != 0:
             log(f"GIT error {label} symbolic-ref {src_branch}: {r3.stderr.strip()}", err=True)
             return False
-        r4 = git_run(dst, "reset", "--quiet", "--mixed", "HEAD", env=env)
+        r4 = git_run(dst, "reset", "--quiet", "--mixed", "HEAD", sync_guard=True)
         if r4.returncode != 0:
             log(f"GIT error {label} reset --mixed HEAD: {r4.stderr.strip()}", err=True)
             return False
     else:
-        r2 = git_run(dst, "reset", "--quiet", "--mixed", "FETCH_HEAD", env=env)
+        r2 = git_run(dst, "reset", "--quiet", "--mixed", "FETCH_HEAD", sync_guard=True)
         if r2.returncode != 0:
             log(f"GIT error {label} reset --mixed FETCH_HEAD: {r2.stderr.strip()}", err=True)
             return False
@@ -354,156 +666,266 @@ def apply_git_head(
     return True
 
 
-def sync_git_state(
-    prev_git: dict[str, Any],
-    source: str | None,
+def sync_ref_map(
+    refs_a: dict[str, str],
+    refs_b: dict[str, str],
+    prev_refs: dict[str, str],
     actions: list[str],
-) -> dict[str, Any]:
-    """Keep both local git repos aligned using 3-way ref state (never unsafe timestamp resets)."""
-    if not (DIR_A / ".git").exists() or not (DIR_B / ".git").exists():
-        return prev_git
+    *,
+    skip_refs: set[str] | None = None,
+) -> tuple[dict[str, str], bool]:
+    """3-way sync a map of refs between DIR_A and DIR_B. Returns (new_refs, had_error)."""
+    skip = skip_refs or set()
+    new_refs: dict[str, str] = {}
+    had_error = False
 
-    branch_a = git_out(DIR_A, "symbolic-ref", "--quiet", "--short", "HEAD")
-    branch_b = git_out(DIR_B, "symbolic-ref", "--quiet", "--short", "HEAD")
-    head_a = git_out(DIR_A, "rev-parse", "HEAD")
-    head_b = git_out(DIR_B, "rev-parse", "HEAD")
+    for ref in sorted(set(refs_a) | set(refs_b) | set(prev_refs)):
+        oid_a = refs_a.get(ref)
+        oid_b = refs_b.get(ref)
+        oid_p = prev_refs.get(ref)
 
-    new_git: dict[str, Any] = dict(prev_git)
-    prev_branch = prev_git.get("branch")
-    prev_head = prev_git.get("head")
-
-    if branch_a and branch_b and head_a and head_b:
-        a_state = (branch_a, head_a)
-        b_state = (branch_b, head_b)
-        p_state = (prev_branch, prev_head)
-
-        if a_state == b_state:
-            new_git["branch"] = branch_a
-            new_git["head"] = head_a
-        else:
-            direction: str | None = None
-            if source == "A" and b_state == p_state:
-                direction = "A->B"
-            elif source == "B" and a_state == p_state:
-                direction = "B->A"
-            elif a_state != p_state and b_state == p_state:
-                direction = "A->B"
-            elif b_state != p_state and a_state == p_state:
-                direction = "B->A"
-            elif branch_a == branch_b:
-                # Both changed (or no baseline yet): only fast-forward if strictly linear.
-                env = os.environ.copy()
-                env["FOLDER_MIRROR_GIT_SYNC"] = "1"
-                git_run(DIR_A, "fetch", "--quiet", "--no-tags", str(DIR_B), "HEAD", env=env)
-                if git_is_ancestor(DIR_A, head_a, head_b):
-                    direction = "B->A"
-                elif git_is_ancestor(DIR_A, head_b, head_a):
-                    direction = "A->B"
-
-            if direction == "A->B":
-                if apply_git_head(DIR_A, DIR_B, branch_a, branch_b, "A->B", actions):
-                    new_git["branch"] = branch_a
-                    new_git["head"] = head_a
-            elif direction == "B->A":
-                if apply_git_head(DIR_B, DIR_A, branch_b, branch_a, "B->A", actions):
-                    new_git["branch"] = branch_b
-                    new_git["head"] = head_b
-            else:
-                log(
-                    f"GIT conflict: A={branch_a}@{head_a[:7]} vs B={branch_b}@{head_b[:7]} diverged; skipping",
-                    err=True,
-                )
-    elif head_a and head_b and head_a != head_b:
-        log("GIT skip: detached HEAD detected in one or both repos", err=True)
-
-    # Sync all refs/remotes/origin/* dynamically using 3-way state + local fetch.
-    prev_remotes = prev_git.get("remotes", {}) if isinstance(prev_git.get("remotes"), dict) else {}
-    rem_a = git_remote_refs(DIR_A)
-    rem_b = git_remote_refs(DIR_B)
-    new_remotes: dict[str, str] = {}
-    env = os.environ.copy()
-    env["FOLDER_MIRROR_GIT_SYNC"] = "1"
-
-    for ref in sorted(set(rem_a) | set(rem_b) | set(prev_remotes)):
-        oid_a = rem_a.get(ref)
-        oid_b = rem_b.get(ref)
-        oid_p = prev_remotes.get(ref)
+        if ref in skip:
+            if oid_a and oid_a == oid_b:
+                new_refs[ref] = oid_a
+            elif oid_p:
+                new_refs[ref] = oid_p
+            continue
 
         if oid_a == oid_b:
             if oid_a is not None:
-                new_remotes[ref] = oid_a
+                new_refs[ref] = oid_a
             continue
 
         if oid_a and oid_b:
             a_chg = oid_a != oid_p
             b_chg = oid_b != oid_p
             if a_chg and not b_chg:
-                r = git_run(DIR_B, "fetch", "--quiet", "--no-tags", str(DIR_A), f"+{ref}:{ref}", env=env)
+                r = git_run(DIR_B, "fetch", "--quiet", "--no-tags", str(DIR_A), f"+{ref}:{ref}", sync_guard=True)
                 if r.returncode == 0:
-                    new_remotes[ref] = oid_a
+                    new_refs[ref] = oid_a
                     actions.append(f"GIT A->B {ref}->{oid_a[:7]}")
                 else:
+                    had_error = True
                     log(f"GIT error A->B {ref}: {r.stderr.strip()}", err=True)
                     if oid_p:
-                        new_remotes[ref] = oid_p
+                        new_refs[ref] = oid_p
             elif b_chg and not a_chg:
-                r = git_run(DIR_A, "fetch", "--quiet", "--no-tags", str(DIR_B), f"+{ref}:{ref}", env=env)
+                r = git_run(DIR_A, "fetch", "--quiet", "--no-tags", str(DIR_B), f"+{ref}:{ref}", sync_guard=True)
                 if r.returncode == 0:
-                    new_remotes[ref] = oid_b
+                    new_refs[ref] = oid_b
                     actions.append(f"GIT B->A {ref}->{oid_b[:7]}")
                 else:
+                    had_error = True
                     log(f"GIT error B->A {ref}: {r.stderr.strip()}", err=True)
                     if oid_p:
-                        new_remotes[ref] = oid_p
+                        new_refs[ref] = oid_p
             else:
-                # Both changed or no baseline: fast-forward if linear.
-                git_run(DIR_A, "fetch", "--quiet", "--no-tags", str(DIR_B), ref, env=env)
+                git_run(DIR_A, "fetch", "--quiet", "--no-tags", str(DIR_B), ref, sync_guard=True)
                 if git_is_ancestor(DIR_A, oid_a, oid_b):
-                    r = git_run(DIR_A, "fetch", "--quiet", "--no-tags", str(DIR_B), f"+{ref}:{ref}", env=env)
+                    r = git_run(DIR_A, "fetch", "--quiet", "--no-tags", str(DIR_B), f"+{ref}:{ref}", sync_guard=True)
                     if r.returncode == 0:
-                        new_remotes[ref] = oid_b
+                        new_refs[ref] = oid_b
                         actions.append(f"GIT B->A {ref}->{oid_b[:7]}")
-                    elif oid_p:
-                        new_remotes[ref] = oid_p
+                    else:
+                        had_error = True
+                        if oid_p:
+                            new_refs[ref] = oid_p
                 elif git_is_ancestor(DIR_A, oid_b, oid_a):
-                    r = git_run(DIR_B, "fetch", "--quiet", "--no-tags", str(DIR_A), f"+{ref}:{ref}", env=env)
+                    r = git_run(DIR_B, "fetch", "--quiet", "--no-tags", str(DIR_A), f"+{ref}:{ref}", sync_guard=True)
                     if r.returncode == 0:
-                        new_remotes[ref] = oid_a
+                        new_refs[ref] = oid_a
                         actions.append(f"GIT A->B {ref}->{oid_a[:7]}")
-                    elif oid_p:
-                        new_remotes[ref] = oid_p
-                elif oid_p:
-                    new_remotes[ref] = oid_p
+                    else:
+                        had_error = True
+                        if oid_p:
+                            new_refs[ref] = oid_p
+                else:
+                    had_error = True
+                    if oid_p:
+                        new_refs[ref] = oid_p
         elif oid_a and not oid_b:
             if oid_p is not None and oid_a == oid_p:
-                r = git_run(DIR_A, "update-ref", "-d", ref, env=env)
+                r = git_run(DIR_A, "update-ref", "-d", ref, sync_guard=True)
                 if r.returncode == 0:
                     actions.append(f"GIT DEL A {ref}")
                 else:
-                    new_remotes[ref] = oid_p
+                    had_error = True
+                    new_refs[ref] = oid_p
             else:
-                r = git_run(DIR_B, "fetch", "--quiet", "--no-tags", str(DIR_A), f"+{ref}:{ref}", env=env)
+                r = git_run(DIR_B, "fetch", "--quiet", "--no-tags", str(DIR_A), f"+{ref}:{ref}", sync_guard=True)
                 if r.returncode == 0:
-                    new_remotes[ref] = oid_a
+                    new_refs[ref] = oid_a
                     actions.append(f"GIT A->B {ref}->{oid_a[:7]}")
                 else:
+                    had_error = True
                     log(f"GIT error A->B {ref}: {r.stderr.strip()}", err=True)
         elif oid_b and not oid_a:
             if oid_p is not None and oid_b == oid_p:
-                r = git_run(DIR_B, "update-ref", "-d", ref, env=env)
+                r = git_run(DIR_B, "update-ref", "-d", ref, sync_guard=True)
                 if r.returncode == 0:
                     actions.append(f"GIT DEL B {ref}")
                 else:
-                    new_remotes[ref] = oid_p
+                    had_error = True
+                    new_refs[ref] = oid_p
             else:
-                r = git_run(DIR_A, "fetch", "--quiet", "--no-tags", str(DIR_B), f"+{ref}:{ref}", env=env)
+                r = git_run(DIR_A, "fetch", "--quiet", "--no-tags", str(DIR_B), f"+{ref}:{ref}", sync_guard=True)
                 if r.returncode == 0:
-                    new_remotes[ref] = oid_b
+                    new_refs[ref] = oid_b
                     actions.append(f"GIT B->A {ref}->{oid_b[:7]}")
                 else:
+                    had_error = True
                     log(f"GIT error B->A {ref}: {r.stderr.strip()}", err=True)
 
+    return new_refs, had_error
+
+
+def sync_branch_tracking_configs(
+    branches: set[str],
+    prev_tracking: dict[str, dict[str, str]],
+    actions: list[str],
+) -> tuple[dict[str, dict[str, str]], bool]:
+    """3-way sync branch.<name>.remote and branch.<name>.merge using 1 config read per repo."""
+    all_a = git_all_branch_tracking(DIR_A)
+    all_b = git_all_branch_tracking(DIR_B)
+    new_tracking: dict[str, dict[str, str]] = {}
+    had_error = False
+
+    for branch in sorted(branches):
+        tr_a = all_a.get(branch)
+        tr_b = all_b.get(branch)
+        tr_p = prev_tracking.get(branch)
+
+        if tr_a == tr_b:
+            if tr_a is not None:
+                new_tracking[branch] = tr_a
+            continue
+
+        a_chg = tr_a != tr_p
+        b_chg = tr_b != tr_p
+        if a_chg and not b_chg:
+            if set_branch_tracking(DIR_B, branch, tr_a):
+                if tr_a is not None:
+                    new_tracking[branch] = tr_a
+                actions.append(f"GIT A->B tracking {branch}")
+            else:
+                had_error = True
+                if tr_p is not None:
+                    new_tracking[branch] = tr_p
+        elif b_chg and not a_chg:
+            if set_branch_tracking(DIR_A, branch, tr_b):
+                if tr_b is not None:
+                    new_tracking[branch] = tr_b
+                actions.append(f"GIT B->A tracking {branch}")
+            else:
+                had_error = True
+                if tr_p is not None:
+                    new_tracking[branch] = tr_p
+        elif tr_a is not None and tr_b is None:
+            if set_branch_tracking(DIR_B, branch, tr_a):
+                new_tracking[branch] = tr_a
+                actions.append(f"GIT A->B tracking {branch}")
+            else:
+                had_error = True
+        elif tr_b is not None and tr_a is None:
+            if set_branch_tracking(DIR_A, branch, tr_b):
+                new_tracking[branch] = tr_b
+                actions.append(f"GIT B->A tracking {branch}")
+            else:
+                had_error = True
+        else:
+            had_error = True
+            if tr_p is not None:
+                new_tracking[branch] = tr_p
+
+    return new_tracking, had_error
+
+
+def sync_git_state(
+    prev_git: dict[str, Any],
+    precomputed: tuple[str | None, str | None, str | None, str | None, str | None],
+    actions: list[str],
+) -> dict[str, Any]:
+    """Keep both local git repos aligned (HEAD, all local branches, remotes, tags, tracking)."""
+    if not (DIR_A / ".git").exists() or not (DIR_B / ".git").exists():
+        return prev_git
+
+    # Re-check git busy & HEAD stability to close the TOCTOU window after file mirroring.
+    if is_git_busy(DIR_A) or is_git_busy(DIR_B):
+        return prev_git
+
+    direction, branch_a, head_a, branch_b, head_b = precomputed
+    cur_branch_a, cur_head_a = git_head_info(DIR_A)
+    cur_branch_b, cur_head_b = git_head_info(DIR_B)
+    if (cur_branch_a, cur_head_a, cur_branch_b, cur_head_b) != (branch_a, head_a, branch_b, head_b):
+        log("GIT defer: HEAD changed mid-sync; retrying on next run", err=True)
+        return prev_git
+
+    new_git: dict[str, Any] = dict(prev_git)
+    had_error = False
+    active_branch: str | None = None
+
+    if direction == "EQUAL" and branch_a and head_a:
+        new_git["branch"] = branch_a
+        new_git["head"] = head_a
+        active_branch = branch_a
+    elif direction == "A->B" and branch_a and branch_b and head_a:
+        if apply_git_head(DIR_A, DIR_B, branch_a, branch_b, "A->B", actions):
+            new_git["branch"] = branch_a
+            new_git["head"] = head_a
+            active_branch = branch_a
+        else:
+            had_error = True
+    elif direction == "B->A" and branch_a and branch_b and head_b:
+        if apply_git_head(DIR_B, DIR_A, branch_b, branch_a, "B->A", actions):
+            new_git["branch"] = branch_b
+            new_git["head"] = head_b
+            active_branch = branch_b
+        else:
+            had_error = True
+    else:
+        had_error = True
+
+    skip_heads: set[str] = set()
+    if active_branch:
+        skip_heads.add(f"refs/heads/{active_branch}")
+    else:
+        if branch_a:
+            skip_heads.add(f"refs/heads/{branch_a}")
+        if branch_b:
+            skip_heads.add(f"refs/heads/{branch_b}")
+
+    heads_a, remotes_a, tags_a = git_all_refs(DIR_A)
+    heads_b, remotes_b, tags_b = git_all_refs(DIR_B)
+
+    prev_heads = prev_git.get("heads", {}) if isinstance(prev_git.get("heads"), dict) else {}
+    prev_remotes = prev_git.get("remotes", {}) if isinstance(prev_git.get("remotes"), dict) else {}
+    prev_tags = prev_git.get("tags", {}) if isinstance(prev_git.get("tags"), dict) else {}
+    prev_tracking = prev_git.get("tracking", {}) if isinstance(prev_git.get("tracking"), dict) else {}
+
+    new_heads, err_h = sync_ref_map(heads_a, heads_b, prev_heads, actions, skip_refs=skip_heads)
+    new_remotes, err_r = sync_ref_map(remotes_a, remotes_b, prev_remotes, actions)
+    new_tags, err_t = sync_ref_map(tags_a, tags_b, prev_tags, actions)
+
+    common_branches = {r.removeprefix("refs/heads/") for r in new_heads}
+    if active_branch:
+        common_branches.add(active_branch)
+    new_tracking, err_tr = sync_branch_tracking_configs(common_branches, prev_tracking, actions)
+
+    new_git["heads"] = new_heads
     new_git["remotes"] = new_remotes
+    new_git["tags"] = new_tags
+    new_git["tracking"] = new_tracking
+
+    if not (had_error or err_h or err_r or err_t or err_tr):
+        meta_a = git_meta_fingerprint(DIR_A)
+        meta_b = git_meta_fingerprint(DIR_B)
+        if meta_a and meta_b:
+            new_git["meta_a"] = meta_a
+            new_git["meta_b"] = meta_b
+    else:
+        new_git.pop("meta_a", None)
+        new_git.pop("meta_b", None)
+
     return new_git
 
 
@@ -521,7 +943,7 @@ def acquire_lock(lock_fh: Any, wait_seconds: float) -> bool:
 
 def sync(*, wait_seconds: float = 0.0, source: str | None = None) -> int:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
-    with LOCK_FILE.open("w") as lock_fh:
+    with LOCK_FILE.open("a+") as lock_fh:
         if not acquire_lock(lock_fh, wait_seconds):
             if wait_seconds > 0:
                 log(f"Skipping sync: lock busy after {wait_seconds:.1f}s", err=True)
@@ -540,6 +962,11 @@ def sync(*, wait_seconds: float = 0.0, source: str | None = None) -> int:
         prev_dirs: set[str] = set(prev_state["dirs"])
         prev_git: dict[str, Any] = prev_state["git"]
 
+        # Defer before mutating working trees if Git HEAD is diverged, detached, or staged-conflicted.
+        should_defer, git_fastpath, precomputed_git = check_git_preconditions(prev_git, source)
+        if should_defer:
+            return 0
+
         snap_a, dirs_a = scan_dir(DIR_A, "a", prev_files)
         snap_b, dirs_b = scan_dir(DIR_B, "b", prev_files)
 
@@ -547,46 +974,83 @@ def sync(*, wait_seconds: float = 0.0, source: str | None = None) -> int:
         actions: list[str] = []
         new_files: dict[str, dict[str, Any]] = {}
 
-        # Plan operations so deletions run before copies (prevents file<->dir collisions).
+        # Plan operations so deletions run before copies (prevents file<->dir & case collisions).
         deletes: list[tuple[str, Path, str]] = []
-        copies: list[tuple[str, Path, Path, str, str, dict[str, Any]]] = []
+        copies: list[tuple[str, Path, Path, str, str, dict[str, Any], bool]] = []
+        case_handled: set[str] = set()
+
+        # Detect case-insensitive APFS path collisions (same casefold path, different case on A vs B).
+        cf_a: dict[str, str] = {p.casefold(): p for p in snap_a}
+        cf_b: dict[str, str] = {p.casefold(): p for p in snap_b}
+        for cf in sorted(set(cf_a) & set(cf_b)):
+            pa, pb = cf_a[cf], cf_b[cf]
+            if pa == pb:
+                continue
+            in_a = snap_a[pa]
+            in_b = snap_b[pb]
+            # Clean case-only renames (one side unchanged vs prev, other side new) are handled
+            # naturally by normal DEL + COPY; only intervene on true case collisions.
+            a_is_old_unchanged = matches_prev(in_a, prev_files.get(pa)) and pb not in prev_files
+            b_is_old_unchanged = matches_prev(in_b, prev_files.get(pb)) and pa not in prev_files
+            if a_is_old_unchanged or b_is_old_unchanged:
+                continue
+
+            case_handled.add(pa)
+            case_handled.add(pb)
+            a_ts = (int(in_a["mtime_ns"]), int(in_a["ctime_ns"]))
+            b_ts = (int(in_b["mtime_ns"]), int(in_b["ctime_ns"]))
+            if a_ts >= b_ts:
+                backup_conflict(DIR_B, pb, "B")
+                deletes.append(("DEL B (case conflict)", DIR_B, pb))
+                copies.append(("A->B", DIR_A, DIR_B, pa, f"A->B (case conflict, newer) {pa}", in_a, False))
+            else:
+                backup_conflict(DIR_A, pa, "A")
+                deletes.append(("DEL A (case conflict)", DIR_A, pa))
+                copies.append(("B->A", DIR_B, DIR_A, pb, f"B->A (case conflict, newer) {pb}", in_b, False))
 
         for rel in all_paths:
+            if rel in case_handled:
+                continue
             in_a = snap_a.get(rel)
             in_b = snap_b.get(rel)
             in_p = prev_files.get(rel)
 
             if in_a and in_b:
-                if in_a["hash"] == in_b["hash"]:
-                    new_files[rel] = {
+                if entry_sig(in_a) == entry_sig(in_b):
+                    rec: dict[str, Any] = {
                         "type": in_a["type"],
                         "hash": in_a["hash"],
                         "a": in_a["meta"],
                         "b": in_b["meta"],
                     }
+                    if in_a.get("mode") is not None:
+                        rec["mode"] = in_a["mode"]
+                    new_files[rel] = rec
                     continue
 
-                a_changed = (in_p is None) or (in_a["hash"] != in_p.get("hash"))
-                b_changed = (in_p is None) or (in_b["hash"] != in_p.get("hash"))
+                a_changed = not matches_prev(in_a, in_p)
+                b_changed = not matches_prev(in_b, in_p)
                 if a_changed and not b_changed:
-                    copies.append(("A->B", DIR_A, DIR_B, rel, f"A->B {rel}", in_a))
+                    copies.append(("A->B", DIR_A, DIR_B, rel, f"A->B {rel}", in_a, False))
                 elif b_changed and not a_changed:
-                    copies.append(("B->A", DIR_B, DIR_A, rel, f"B->A {rel}", in_b))
+                    copies.append(("B->A", DIR_B, DIR_A, rel, f"B->A {rel}", in_b, False))
                 else:
-                    if int(in_a["mtime_ns"]) >= int(in_b["mtime_ns"]):
-                        copies.append(("A->B", DIR_A, DIR_B, rel, f"A->B (conflict, newer) {rel}", in_a))
+                    a_ts = (int(in_a["mtime_ns"]), int(in_a["ctime_ns"]))
+                    b_ts = (int(in_b["mtime_ns"]), int(in_b["ctime_ns"]))
+                    if a_ts >= b_ts:
+                        copies.append(("A->B", DIR_A, DIR_B, rel, f"A->B (conflict, newer) {rel}", in_a, True))
                     else:
-                        copies.append(("B->A", DIR_B, DIR_A, rel, f"B->A (conflict, newer) {rel}", in_b))
+                        copies.append(("B->A", DIR_B, DIR_A, rel, f"B->A (conflict, newer) {rel}", in_b, True))
             elif in_a and not in_b:
-                if in_p is not None and in_a["hash"] == in_p.get("hash"):
+                if matches_prev(in_a, in_p):
                     deletes.append(("DEL A", DIR_A, rel))
                 else:
-                    copies.append(("A->B", DIR_A, DIR_B, rel, f"A->B {rel}", in_a))
+                    copies.append(("A->B", DIR_A, DIR_B, rel, f"A->B {rel}", in_a, False))
             elif in_b and not in_a:
-                if in_p is not None and in_b["hash"] == in_p.get("hash"):
+                if matches_prev(in_b, in_p):
                     deletes.append(("DEL B", DIR_B, rel))
                 else:
-                    copies.append(("B->A", DIR_B, DIR_A, rel, f"B->A {rel}", in_b))
+                    copies.append(("B->A", DIR_B, DIR_A, rel, f"B->A {rel}", in_b, False))
 
         # Phase 1: Execute file deletions first.
         for label, root, rel in deletes:
@@ -633,21 +1097,27 @@ def sync(*, wait_seconds: float = 0.0, source: str | None = None) -> int:
                     kept_nonempty_dirs.add(d)
 
         # Phase 2: Execute atomic file/symlink copies and record deterministic state.
-        for direction, src_root, dst_root, rel, action_label, src_snap in copies:
+        for direction, src_root, dst_root, rel, action_label, src_snap, is_conflict in copies:
             try:
-                entry_type, copied_hash, dst_meta = copy_entry(src_root, dst_root, rel)
+                if is_conflict:
+                    losing_side = "B" if direction == "A->B" else "A"
+                    backup_conflict(dst_root, rel, losing_side)
+                entry_type, copied_hash, copied_mode, dst_meta = copy_entry(src_root, dst_root, rel)
                 actions.append(action_label)
                 entry: dict[str, Any] = {
                     "type": entry_type,
                     "hash": copied_hash,
                 }
+                if copied_mode is not None:
+                    entry["mode"] = copied_mode
+                src_unchanged = copied_hash == src_snap["hash"] and copied_mode == src_snap.get("mode")
                 if direction == "A->B":
-                    if copied_hash == src_snap["hash"]:
+                    if src_unchanged:
                         entry["a"] = src_snap["meta"]
                     entry["b"] = dst_meta
                 else:
                     entry["a"] = dst_meta
-                    if copied_hash == src_snap["hash"]:
+                    if src_unchanged:
                         entry["b"] = src_snap["meta"]
                 new_files[rel] = entry
             except OSError as exc:
@@ -685,7 +1155,10 @@ def sync(*, wait_seconds: float = 0.0, source: str | None = None) -> int:
                 except OSError as exc:
                     log(f"Error MKDIR A {d}: {exc}", err=True)
 
-        new_git = sync_git_state(prev_git, source, actions)
+        if git_fastpath or precomputed_git is None:
+            new_git = prev_git
+        else:
+            new_git = sync_git_state(prev_git, precomputed_git, actions)
 
         new_state = {
             "files": new_files,
@@ -699,8 +1172,10 @@ def sync(*, wait_seconds: float = 0.0, source: str | None = None) -> int:
             for act in actions:
                 log(act)
 
-        trim_log_file(LOG_FILE)
-        trim_log_file(ERR_LOG_FILE)
+        rotate_log_file(LOG_FILE)
+        rotate_log_file(ERR_LOG_FILE)
+        rotate_log_file(LAUNCHD_LOG_FILE)
+        rotate_log_file(LAUNCHD_ERR_LOG_FILE)
 
     return 0
 

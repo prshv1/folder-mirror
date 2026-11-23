@@ -32,8 +32,8 @@
     <key>LowPriorityIO</key>
     <true/>
     <key>StandardOutPath</key>
-    <string>{{HOME}}/.local/state/folder-mirror/sync.log</string>
+    <string>{{HOME}}/.local/state/folder-mirror/launchd.log</string>
     <key>StandardErrorPath</key>
-    <string>{{HOME}}/.local/state/folder-mirror/sync.err.log</string>
+    <string>{{HOME}}/.local/state/folder-mirror/launchd.err.log</string>
 </dict>
 </plist>

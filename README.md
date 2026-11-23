@@ -1,9 +1,8 @@
 # folder-mirror
 
-Two-way folder mirror for macOS with safe file writes, conflict backups, and optional Git syncing.
+Fast, safe two-way folder mirror for macOS.
 
-### What changed in Council Run 1
-- Switched to safe temporary-file swaps so a crash or power cut can't leave half-written files.
-- Saves a backup copy if the exact same file is edited in both folders at once.
-- Added optional Git syncing + Git hooks so committing or pulling in either folder updates the other one too.
-- Changed background check interval from 5s to 30s at low background priority.
+### What changed in Council Run 2
+- **~9x less CPU when idle:** skips reading unchanged files and skips running Git when nothing changed.
+- Handles uppercase/lowercase filename conflicts cleanly on macOS.
+- Protects against half-finished Git operations and automatically trims log files.
